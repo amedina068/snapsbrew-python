@@ -18,6 +18,7 @@ import httpx
 
 from snapsbrew._version import __version__
 from snapsbrew.errors import (
+    IDEMPOTENCY_KEY_IN_PROGRESS,
     APIConnectionError,
     APIError,
     APITimeoutError,
@@ -65,6 +66,9 @@ class RequestSpec:
 
     ``idempotent`` tells the retry logic that a second copy of the request is
     safe. The server does not do the action two times.
+
+    ``idempotency_key`` is the key in the body, if the request has one. Only a
+    request with a key can wait for another request that holds the same key.
     """
 
     method: str
@@ -73,6 +77,7 @@ class RequestSpec:
     json: Any = None
     files: Mapping[str, tuple[str, bytes, str]] | None = None
     idempotent: bool = False
+    idempotency_key: str | None = None
 
 
 def normalize_base_url(base_url: str) -> str:
@@ -193,12 +198,11 @@ def response_retry_delay(
 
     The client retries a 429 for every method, because the rate limiter refuses
     the request before the app does the action. The client retries a 5xx only
-    for an idempotent request.
+    for an idempotent request. The client retries a 409 with the code
+    ``idempotency_key_in_progress`` only for a request with an idempotency key,
+    because the other request that holds the key can finish.
     """
-    if attempt >= max_retries:
-        return None
-    status = response.status_code
-    if status != 429 and not (status >= 500 and spec.idempotent):
+    if attempt >= max_retries or not _retryable_response(response, spec):
         return None
     retry_after = parse_retry_after(response.headers.get("retry-after"))
     if retry_after is None:
@@ -206,6 +210,17 @@ def response_retry_delay(
     if retry_after > MAX_RETRY_AFTER:
         return None
     return retry_after
+
+
+def _retryable_response(response: httpx.Response, spec: RequestSpec) -> bool:
+    status = response.status_code
+    if status == 429:
+        return True
+    if status >= 500:
+        return spec.idempotent
+    if status == 409 and spec.idempotency_key is not None:
+        return error_code(response) == IDEMPOTENCY_KEY_IN_PROGRESS
+    return False
 
 
 def connection_error(exc: httpx.TransportError) -> APIConnectionError:
@@ -239,6 +254,13 @@ def decode_body(response: httpx.Response) -> Any:
         return response.json()
     except ValueError:
         return response.text
+
+
+def error_code(response: httpx.Response) -> str | None:
+    """Return the ``code`` field of a JSON error body, or ``None``."""
+    body = decode_body(response)
+    code = body.get("code") if isinstance(body, dict) else None
+    return code if isinstance(code, str) else None
 
 
 def error_from_response(response: httpx.Response) -> APIError:

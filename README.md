@@ -168,6 +168,10 @@ If a request can time out, give an `idempotency_key`. The instance keeps the key
 snap = client.snaps.create(template_id, variants, idempotency_key="order-1042-card")
 ```
 
+A key belongs to one kind of request. A key that a batch used raises `ConflictError` on `snaps.create()`, and the reverse is also true. Use a new key for each kind.
+
+A `template_id` that does not exist in your company raises `ValidationError` with `errors["template_id"]`, not `NotFoundError`.
+
 ### Batches
 
 A batch renders up to 100 snaps from one template in the background:
@@ -197,8 +201,10 @@ A batch with the status `completed` rendered at least one item. Read `batch.fail
 shot = client.screenshots.create("https://example.com", width=1280, height=720)
 shot = client.screenshots.get(shot.id)
 for shot in client.screenshots.iter():
-    ...
+    print(shot.id, shot.image_url)
 ```
+
+The list, the read and the create all give `image_url`, the URL of the captured image.
 
 ### Media
 
@@ -206,7 +212,10 @@ for shot in client.screenshots.iter():
 media = client.media.upload("logo.png")  # a path
 media = client.media.upload(data, filename="logo.png")  # bytes
 page = client.media.list(page=1)  # 12 images for each page
+print(media.src)  # use this URL as the image_url of a variant
 ```
+
+A `Media` has `id`, `uuid`, `name`, `file_name`, `mime_type`, `size`, `original_url`, `src` and `created_at`.
 
 ### Guides
 
@@ -280,6 +289,8 @@ url = signed_url(
 
 The instance keeps each image in a cache by its full URL. The same URL returns the same image and costs no new credit. If you publish a new version of the template, the instance renders the image again.
 
+A URL with a bad signature, or for a template that does not exist, does not return an error status. The instance returns its placeholder image with the status 200. If you see the placeholder, make sure that the key belongs to the owner of the template.
+
 The signature is the HMAC-SHA256 hex digest of the query parameters, without `signature`. The parameters are sorted by key and joined as `key=value` with `&`. The `variants` value is standard base64 of the JSON array. `sign()`, `canonical_string()` and `encode_variants()` give each step, if you need them.
 
 ## Errors
@@ -295,23 +306,40 @@ SnapsbrewError
 │   ├── AuthenticationError   401: the token is missing or not valid
 │   ├── AuthorizationError    403: the token cannot do this action
 │   ├── NotFoundError         404
-│   ├── ConflictError         409: for example, an idempotency key in progress
+│   ├── ConflictError         409: .code tells the cause, .retryable tells if a repeat can work
 │   ├── ValidationError       422: .errors has the field errors
-│   ├── RateLimitError        429: .retry_after has the wait in seconds
+│   ├── RateLimitError        429: .retry_after, .limit and .remaining
 │   └── ServerError           5xx
 └── WaitTimeoutError          batches.wait() did not see a terminal status in time
 ```
 
 Each `APIError` has `status_code`, `message`, `body`, `code`, `request_id` and `response`. Give `request_id` to support when you report a problem.
 
+`AuthorizationError` (403) means that the token has no `api_requests` ability, or that a permission check refused the action. `POST /v1/snaps` sends 403 for both cases.
+
+`ConflictError` (409) has a `code`. The package exports a constant for each code:
+
+| `code` | Cause | Can a repeat work? |
+|---|---|---|
+| `IDEMPOTENCY_KEY_IN_PROGRESS` | Another request with the same key runs now. | Yes, with the same key. The client retries it. |
+| `IDEMPOTENCY_KEY_BELONGS_TO_BATCH` | `snaps.create()` sent a key that a batch owns. | No. Send a new key. |
+| `IDEMPOTENCY_KEY_BELONGS_TO_SNAP` | `batches.create()` sent a key that a single snap owns. | No. Send a new key. |
+
+In each case, the instance created nothing and used no credit.
+
+`ServerError` (5xx) from `POST /v1/snaps` has the code `INTERNAL_ERROR` and a fixed message. The body holds no details of the fault. Give `request_id` to support.
+
 ```python
-from snapsbrew import RateLimitError, ValidationError
+from snapsbrew import ConflictError, RateLimitError, ValidationError
 
 try:
-    snap = client.snaps.create(template_id, variants)
+    snap = client.snaps.create(template_id, variants, idempotency_key=key)
 except ValidationError as error:
     for field, messages in error.errors.items():
         print(field, messages)
+except ConflictError as error:
+    if not error.retryable:
+        print("Use a new key:", error.code)
 except RateLimitError as error:
     print("Wait", error.retry_after, "seconds")
 ```
@@ -325,6 +353,8 @@ The client retries a failed request two times by default. The wait before each r
 | Failure | GET, and POST with `idempotency_key` | POST without `idempotency_key` |
 |---|---|---|
 | 429 | Retry | Retry |
+| 409 `idempotency_key_in_progress` | Retry (POST with a key only) | No retry |
+| Other 409 | No retry | No retry |
 | 5xx | Retry | No retry |
 | Connection not made (DNS, refused, pool timeout) | Retry | Retry |
 | Read timeout or dropped connection | Retry | No retry |
@@ -332,6 +362,8 @@ The client retries a failed request two times by default. The wait before each r
 
 - If a response has a `Retry-After` header, the client waits for that time.
 - If `Retry-After` is more than 60 seconds, the client does not wait. It raises `RateLimitError` at once.
+- The API allows 60 requests per minute for one user. A preview also has a limit of 10 per minute. Each response has the headers `X-RateLimit-Limit` and `X-RateLimit-Remaining`.
+- If another request holds the same idempotency key, the client waits with the normal backoff and sends the request again. If the other request does not finish before the last retry, the client raises `ConflictError`.
 - `batches.cancel()` is idempotent, so the client retries it like a GET.
 - Set `max_retries=0` to stop all retries.
 

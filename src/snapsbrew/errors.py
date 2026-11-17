@@ -10,20 +10,24 @@ All errors come from :class:`SnapsbrewError`::
     |   +-- AuthenticationError    401
     |   +-- AuthorizationError     403
     |   +-- NotFoundError          404
-    |   +-- ConflictError          409
+    |   +-- ConflictError          409, with the conflict code
     |   +-- ValidationError        422, with the field errors
-    |   +-- RateLimitError         429, with the Retry-After value
+    |   +-- RateLimitError         429, with the Retry-After value and the limit
     |   +-- ServerError            5xx
     +-- WaitTimeoutError           a batch did not finish in the wait time
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Final
 
 import httpx
 
 __all__ = [
+    "IDEMPOTENCY_KEY_BELONGS_TO_BATCH",
+    "IDEMPOTENCY_KEY_BELONGS_TO_SNAP",
+    "IDEMPOTENCY_KEY_IN_PROGRESS",
+    "INTERNAL_ERROR",
     "APIConnectionError",
     "APIError",
     "APITimeoutError",
@@ -38,6 +42,20 @@ __all__ = [
     "ValidationError",
     "WaitTimeoutError",
 ]
+
+# The `code` values of a 409 for an idempotency key.
+
+IDEMPOTENCY_KEY_IN_PROGRESS: Final = "idempotency_key_in_progress"
+"""Another request with the same key runs now. A repeat with the same key is safe."""
+
+IDEMPOTENCY_KEY_BELONGS_TO_SNAP: Final = "idempotency_key_belongs_to_snap"
+"""A batch request sent a key that belongs to a single snap. Send a new key."""
+
+IDEMPOTENCY_KEY_BELONGS_TO_BATCH: Final = "idempotency_key_belongs_to_batch"
+"""A single snap request sent a key that belongs to a batch. Send a new key."""
+
+INTERNAL_ERROR: Final = "internal_error"
+"""The `code` of a 500 from ``POST /v1/snaps``. The body has no exception text."""
 
 
 class SnapsbrewError(Exception):
@@ -103,19 +121,40 @@ class AuthenticationError(APIError):
 class AuthorizationError(APIError):
     """The token is valid but it cannot do this action (403).
 
-    A token must have the ``api_requests`` ability.
+    A token must have the ``api_requests`` ability. A permission check of the
+    instance can also refuse the request, for example on ``POST /v1/snaps``.
     """
 
 
 class NotFoundError(APIError):
-    """The resource does not exist in your company (404)."""
+    """The resource does not exist in your company (404).
+
+    ``POST /v1/snaps`` and ``POST /v1/snaps/batches`` do not send 404 for a
+    ``template_id`` that does not exist. They send :class:`ValidationError`.
+    """
 
 
 class ConflictError(APIError):
     """The request conflicts with the state on the server (409).
 
-    For example, a request with the same ``idempotency_key`` is in progress.
+    Read ``code`` to know the cause:
+
+    - :data:`IDEMPOTENCY_KEY_IN_PROGRESS`: another request with the same
+      ``idempotency_key`` runs now. The client retries this case. A repeat with
+      the same key is safe.
+    - :data:`IDEMPOTENCY_KEY_BELONGS_TO_SNAP` and
+      :data:`IDEMPOTENCY_KEY_BELONGS_TO_BATCH`: the key belongs to a different
+      kind of request. A repeat never succeeds. Send a new key.
+    - ``"legacy_edit_rejected_for_v2"``: a v1 edit of a template that uses the v2
+      editor document.
+
+    The instance created nothing in each case.
     """
+
+    @property
+    def retryable(self) -> bool:
+        """``True`` when a repeat with the same ``idempotency_key`` can succeed."""
+        return self.code == IDEMPOTENCY_KEY_IN_PROGRESS
 
 
 class ValidationError(APIError):
@@ -135,6 +174,9 @@ class RateLimitError(APIError):
 
     Attributes:
         retry_after: The seconds to wait from the ``Retry-After`` header, or ``None``.
+        limit: The requests allowed in one minute, from ``X-RateLimit-Limit``, or ``None``.
+        remaining: The requests left in the minute, from ``X-RateLimit-Remaining``,
+            or ``None``.
     """
 
     def __init__(
@@ -147,10 +189,16 @@ class RateLimitError(APIError):
     ) -> None:
         super().__init__(message, response=response, body=body)
         self.retry_after = retry_after
+        self.limit = _int_header(response, "x-ratelimit-limit")
+        self.remaining = _int_header(response, "x-ratelimit-remaining")
 
 
 class ServerError(APIError):
-    """The instance had an internal error (5xx)."""
+    """The instance had an internal error (5xx).
+
+    ``POST /v1/snaps`` sends the code :data:`INTERNAL_ERROR` and a fixed message.
+    Give ``request_id`` to support.
+    """
 
 
 def _field_errors(body: Any) -> dict[str, list[str]]:
@@ -166,3 +214,13 @@ def _field_errors(body: Any) -> dict[str, list[str]]:
         else:
             errors[str(field)] = [str(messages)]
     return errors
+
+
+def _int_header(response: httpx.Response, name: str) -> int | None:
+    value = response.headers.get(name)
+    if value is None:
+        return None
+    try:
+        return int(value.strip())
+    except ValueError:
+        return None

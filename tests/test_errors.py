@@ -7,9 +7,14 @@ import pytest
 import respx
 
 from snapsbrew import (
+    IDEMPOTENCY_KEY_BELONGS_TO_BATCH,
+    IDEMPOTENCY_KEY_BELONGS_TO_SNAP,
+    IDEMPOTENCY_KEY_IN_PROGRESS,
+    INTERNAL_ERROR,
     APIConnectionError,
     APIError,
     APITimeoutError,
+    AsyncSnapsbrew,
     AuthenticationError,
     AuthorizationError,
     BadRequestError,
@@ -19,9 +24,20 @@ from snapsbrew import (
     ServerError,
     Snapsbrew,
     SnapsbrewError,
+    Text,
     ValidationError,
 )
-from tests.conftest import TEMPLATE_ID
+from tests.conftest import TEMPLATE_ID, create_with_key
+
+# The bodies that the app sends at commit 4d008a5.
+FORBIDDEN_BODY = {"message": "This action is unauthorized."}
+INTERNAL_ERROR_BODY = {
+    "message": (
+        "The server could not create the snap. Try again later. If the error continues, "
+        "contact support and give the X-Request-Uuid header of this response."
+    ),
+    "code": "internal_error",
+}
 
 
 @pytest.mark.parametrize(
@@ -84,9 +100,11 @@ def test_validation_error_without_errors_key(client: Snapsbrew, api: respx.MockR
     assert caught.value.errors == {}
 
 
-def test_rate_limit_error_has_retry_after(api: respx.MockRouter) -> None:
+def test_rate_limit_error_has_retry_after_and_the_limit(api: respx.MockRouter) -> None:
     api.get("/v1/snaps/preview").respond(
-        429, json={"message": "Too Many Attempts."}, headers={"Retry-After": "42"}
+        429,
+        json={"message": "Too Many Attempts."},
+        headers={"Retry-After": "42", "X-RateLimit-Limit": "10", "X-RateLimit-Remaining": "0"},
     )
     with (
         Snapsbrew(base_url="https://snapsbrew.test", token="t", max_retries=0) as client,
@@ -94,6 +112,86 @@ def test_rate_limit_error_has_retry_after(api: respx.MockRouter) -> None:
     ):
         client.snaps.preview(TEMPLATE_ID)
     assert caught.value.retry_after == 42.0
+    assert caught.value.limit == 10
+    assert caught.value.remaining == 0
+
+
+def test_rate_limit_error_without_limit_headers(client: Snapsbrew, api: respx.MockRouter) -> None:
+    api.get("/v1/auth").respond(429, headers={"Retry-After": "3600", "X-RateLimit-Limit": "x"})
+    with pytest.raises(RateLimitError) as caught:
+        client.whoami()
+    assert caught.value.limit is None
+    assert caught.value.remaining is None
+
+
+def test_a_403_on_snap_create_is_an_authorization_error(
+    client: Snapsbrew, api: respx.MockRouter
+) -> None:
+    route = api.post("/v1/snaps").respond(403, json=FORBIDDEN_BODY)
+    with pytest.raises(AuthorizationError) as caught:
+        client.snaps.create(TEMPLATE_ID, [Text("title", "Hi")], idempotency_key="k-1")
+    assert caught.value.status_code == 403
+    assert caught.value.message == "This action is unauthorized."
+    assert route.call_count == 1
+
+
+async def test_a_403_on_snap_create_is_an_authorization_error_async(
+    aclient: AsyncSnapsbrew, api: respx.MockRouter
+) -> None:
+    api.post("/v1/snaps").respond(403, json=FORBIDDEN_BODY)
+    with pytest.raises(AuthorizationError):
+        await aclient.snaps.create(TEMPLATE_ID)
+
+
+@pytest.mark.parametrize(
+    ("path", "code", "retryable"),
+    [
+        ("/v1/snaps", IDEMPOTENCY_KEY_IN_PROGRESS, True),
+        ("/v1/snaps", IDEMPOTENCY_KEY_BELONGS_TO_BATCH, False),
+        ("/v1/snaps/batches", IDEMPOTENCY_KEY_IN_PROGRESS, True),
+        ("/v1/snaps/batches", IDEMPOTENCY_KEY_BELONGS_TO_SNAP, False),
+    ],
+)
+def test_a_409_conflict_error_has_the_code(
+    path: str, code: str, retryable: bool, api: respx.MockRouter
+) -> None:
+    api.post(path).respond(
+        409, json={"message": "Nothing was created.", "code": code}, headers={"X-Request-Uuid": "r"}
+    )
+    with (
+        Snapsbrew(base_url="https://snapsbrew.test", token="t", max_retries=0) as client,
+        pytest.raises(ConflictError) as caught,
+    ):
+        create_with_key(client, path)
+    assert caught.value.code == code
+    assert caught.value.retryable is retryable
+    assert caught.value.message == "Nothing was created."
+    assert caught.value.request_id == "r"
+
+
+def test_the_conflict_codes_match_the_app() -> None:
+    assert IDEMPOTENCY_KEY_IN_PROGRESS == "idempotency_key_in_progress"
+    assert IDEMPOTENCY_KEY_BELONGS_TO_SNAP == "idempotency_key_belongs_to_snap"
+    assert IDEMPOTENCY_KEY_BELONGS_TO_BATCH == "idempotency_key_belongs_to_batch"
+    assert INTERNAL_ERROR == "internal_error"
+
+
+def test_a_500_on_snap_create_is_a_server_error_with_the_generic_code(
+    client: Snapsbrew, api: respx.MockRouter
+) -> None:
+    route = api.post("/v1/snaps").respond(
+        500, json=INTERNAL_ERROR_BODY, headers={"X-Request-Uuid": "req-500"}
+    )
+    with pytest.raises(ServerError) as caught:
+        client.snaps.create(TEMPLATE_ID)
+    error = caught.value
+    assert error.status_code == 500
+    assert error.code == INTERNAL_ERROR
+    assert error.message == INTERNAL_ERROR_BODY["message"]
+    assert error.request_id == "req-500"
+    assert str(error).startswith("500: The server could not create the snap.")
+    # A POST without an idempotency key is not retried after a 5xx.
+    assert route.call_count == 1
 
 
 def test_editor_style_code_is_kept(client: Snapsbrew, api: respx.MockRouter) -> None:

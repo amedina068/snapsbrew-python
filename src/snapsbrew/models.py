@@ -54,12 +54,13 @@ class Layer:
     """One addressable layer of a template.
 
     ``available_modifications`` maps each variant property that the layer
-    accepts to its current value, for example ``{"text": "Hello"}``.
+    accepts to its current value, for example ``{"text": "Hello"}``. It is
+    empty for a layer that accepts no variant, for example an empty layer.
+    The API does not send the layer type.
     """
 
     layer: str
     available_modifications: Mapping[str, Any]
-    type: str | None = None
     raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
     @classmethod
@@ -69,7 +70,6 @@ class Layer:
             layer=_str(data.get("layer")),
             # The app sends `[]`, not `{}`, for a layer with no modifications.
             available_modifications=dict(modifications) if isinstance(modifications, dict) else {},
-            type=_opt_str(data.get("type")),
             raw=data,
         )
 
@@ -149,6 +149,9 @@ class Snap:
     ``media_url`` is ``None`` until the status is ``completed``.
     ``replayed`` is ``True`` when the server returned an earlier snap for the same
     ``idempotency_key`` and rendered nothing.
+    ``variants`` is empty when the request sent no variants. ``template_id``,
+    ``template_title``, ``width`` and ``height`` are ``None`` for a snap that
+    has no source template.
     """
 
     id: str
@@ -287,7 +290,11 @@ class Batch:
 
 @dataclass(frozen=True)
 class Screenshot:
-    """A capture of a web page."""
+    """A capture of a web page.
+
+    ``image_url`` is the URL of the captured image. The list, the read and the
+    create all send it. It is ``None`` when the capture has no stored image.
+    """
 
     id: str
     url: str | None
@@ -313,11 +320,21 @@ class Screenshot:
 
 @dataclass(frozen=True)
 class Media:
-    """An image in the media library of your account."""
+    """An image in the media library of your account.
+
+    Use ``src`` as the ``image_url`` of a variant. The API sends the stored
+    media record, so ``raw`` can hold more fields than this model.
+    """
 
     id: int
     file_name: str
     src: str | None
+    uuid: str | None = None
+    name: str | None = None
+    mime_type: str | None = None
+    size: int | None = None
+    original_url: str | None = None
+    created_at: datetime | None = None
     raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
     @classmethod
@@ -326,6 +343,12 @@ class Media:
             id=_int(data.get("id")),
             file_name=_str(data.get("file_name")),
             src=_opt_str(data.get("src")),
+            uuid=_opt_str(data.get("uuid")),
+            name=_opt_str(data.get("name")),
+            mime_type=_opt_str(data.get("mime_type")),
+            size=_opt_int(data.get("size")),
+            original_url=_opt_str(data.get("original_url")),
+            created_at=_datetime(data.get("created_at")),
             raw=data,
         )
 
@@ -371,16 +394,14 @@ class MediaPage:
 
     @classmethod
     def from_dict(cls, body: Mapping[str, Any]) -> MediaPage:
-        # The app sends the flat Laravel paginator. The spec shows `meta`.
-        # Read both.
-        meta = body.get("meta")
-        source: Mapping[str, Any] = meta if isinstance(meta, dict) else body
+        # The body is a flat Laravel paginator: the page fields sit next to
+        # `data`, and there is no `meta` key.
         return cls(
             data=tuple(Media.from_dict(item) for item in _dicts(body.get("data"))),
-            current_page=_int(source.get("current_page")) or 1,
-            last_page=_opt_int(source.get("last_page")),
-            per_page=_opt_int(source.get("per_page")),
-            total=_opt_int(source.get("total")),
+            current_page=_int(body.get("current_page")) or 1,
+            last_page=_opt_int(body.get("last_page")),
+            per_page=_opt_int(body.get("per_page")),
+            total=_opt_int(body.get("total")),
         )
 
 

@@ -9,7 +9,16 @@ import pytest
 import respx
 
 from snapsbrew import AsyncSnapsbrew, NotFoundError, Text, WaitTimeoutError
-from tests.conftest import BATCH_BODY, SNAP_BODY, TEMPLATE_ID, SleepRecorder
+from tests.conftest import (
+    BATCH_BODY,
+    MEDIA_BODY,
+    MEDIA_PAGE_BODY,
+    SCREENSHOT_BODY,
+    SCREENSHOT_LIST_ITEM,
+    SNAP_BODY,
+    TEMPLATE_ID,
+    SleepRecorder,
+)
 
 TEMPLATE_BODY = {
     "uuid": TEMPLATE_ID,
@@ -102,24 +111,25 @@ async def test_batches(
 
 
 async def test_screenshots(aclient: AsyncSnapsbrew, api: respx.MockRouter) -> None:
-    body = {"id": "s1", "url": "https://e.com", "image_url": None, "width": 1, "height": 2}
     api.get("/v1/screenshots").respond(
-        json={"data": [{**body, "uuid": "s1"}], "meta": {"next_cursor": None}}
+        json={"data": [SCREENSHOT_LIST_ITEM], "meta": {"next_cursor": None}}
     )
-    api.get("/v1/screenshots/s1").respond(json={"data": body})
-    api.post("/v1/screenshots").respond(json={"data": body})
-    assert (await aclient.screenshots.list()).data[0].id == "s1"
-    assert [s.id async for s in aclient.screenshots.iter()] == ["s1"]
-    assert (await aclient.screenshots.get("s1")).height == 2
-    assert (await aclient.screenshots.create("https://e.com")).url == "https://e.com"
+    api.get("/v1/screenshots/a1b2c3").respond(json={"data": SCREENSHOT_BODY})
+    api.post("/v1/screenshots").respond(json={"data": SCREENSHOT_BODY})
+    listed = (await aclient.screenshots.list()).data[0]
+    assert listed.id == "a1b2c3"
+    assert listed.image_url == SCREENSHOT_LIST_ITEM["image_url"]
+    assert [s.image_url async for s in aclient.screenshots.iter()] == [listed.image_url]
+    assert (await aclient.screenshots.get("a1b2c3")).height == 780
+    assert (await aclient.screenshots.create("https://example.com")).url == "https://example.com"
 
 
 async def test_media(aclient: AsyncSnapsbrew, api: respx.MockRouter) -> None:
-    api.get("/v1/media").respond(
-        json={"current_page": 1, "last_page": 1, "data": [{"id": 3, "file_name": "a.png"}]}
-    )
-    upload = api.post("/v1/media").respond(json={"id": 4, "file_name": "b.png", "src": "x"})
-    assert (await aclient.media.list()).data[0].file_name == "a.png"
+    api.get("/v1/media").respond(json=MEDIA_PAGE_BODY)
+    upload = api.post("/v1/media").respond(json={**MEDIA_BODY, "id": 4, "file_name": "b.png"})
+    page = await aclient.media.list()
+    assert page.data[0].file_name == "logo.png"
+    assert page.data[0].size == 20480
     assert (await aclient.media.upload(b"bytes", filename="b.png")).id == 4
     assert b'filename="b.png"' in upload.calls.last.request.content
 

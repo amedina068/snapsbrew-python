@@ -401,8 +401,16 @@ class Snaps:
         at once with the status ``pending``. Then it posts the result to the webhook.
 
         If you give ``idempotency_key``, a retry with the same key returns the
-        same snap and renders nothing. The client then also retries after a 5xx
-        and after a read timeout.
+        same snap and renders nothing. The client then also retries after a 5xx,
+        after a read timeout and after a 409 with the code
+        ``idempotency_key_in_progress``.
+
+        Raises:
+            ValidationError: A field is not valid. A ``template_id`` that does not
+                exist in your company is a validation error, not a 404.
+            ConflictError: The ``idempotency_key`` belongs to a batch, or another
+                request still holds it after all retries. Read ``code``.
+            AuthorizationError: The token or a permission check refused the request.
         """
         body = _snap_body(
             target=("template_id", template_id),
@@ -413,7 +421,13 @@ class Snaps:
             webhook_url=webhook_url,
             idempotency_key=idempotency_key,
         )
-        spec = RequestSpec("POST", "/v1/snaps", json=body, idempotent=idempotency_key is not None)
+        spec = RequestSpec(
+            "POST",
+            "/v1/snaps",
+            json=body,
+            idempotent=idempotency_key is not None,
+            idempotency_key=idempotency_key,
+        )
         return _snap_from_response(self._client._send(spec))
 
     def create_from_collection(
@@ -426,7 +440,11 @@ class Snaps:
         transparent: bool | None = None,
         webhook_url: str | None = None,
     ) -> list[Snap]:
-        """Render one snap for each template of a collection."""
+        """Render one snap for each template of a collection.
+
+        A collection with no templates raises :class:`NotFoundError`. This
+        request does not accept an ``idempotency_key``.
+        """
         body = _snap_body(
             target=("collection_id", collection_id),
             variants=variants,
@@ -475,6 +493,11 @@ class Batches:
         Each item is a list of variants, or a dict with ``variants`` and an
         optional ``identifier``. The instance posts one webhook to
         ``webhook_url`` when the batch finishes.
+
+        If you give ``idempotency_key``, a retry with the same key returns the
+        same batch and starts nothing. The client then retries like
+        :meth:`Snaps.create`. A key that belongs to a single snap raises
+        :class:`ConflictError` with the code ``idempotency_key_belongs_to_snap``.
         """
         body = _batch_body(
             template_id=template_id,
@@ -487,7 +510,11 @@ class Batches:
             idempotency_key=idempotency_key,
         )
         spec = RequestSpec(
-            "POST", "/v1/snaps/batches", json=body, idempotent=idempotency_key is not None
+            "POST",
+            "/v1/snaps/batches",
+            json=body,
+            idempotent=idempotency_key is not None,
+            idempotency_key=idempotency_key,
         )
         return _batch_from_response(self._client._send(spec))
 
@@ -751,7 +778,13 @@ class AsyncSnaps:
             webhook_url=webhook_url,
             idempotency_key=idempotency_key,
         )
-        spec = RequestSpec("POST", "/v1/snaps", json=body, idempotent=idempotency_key is not None)
+        spec = RequestSpec(
+            "POST",
+            "/v1/snaps",
+            json=body,
+            idempotent=idempotency_key is not None,
+            idempotency_key=idempotency_key,
+        )
         return _snap_from_response(await self._client._send(spec))
 
     async def create_from_collection(
@@ -764,7 +797,7 @@ class AsyncSnaps:
         transparent: bool | None = None,
         webhook_url: str | None = None,
     ) -> list[Snap]:
-        """Render one snap for each template of a collection."""
+        """Render one snap for each template. See :meth:`Snaps.create_from_collection`."""
         body = _snap_body(
             target=("collection_id", collection_id),
             variants=variants,
@@ -817,7 +850,11 @@ class AsyncBatches:
             idempotency_key=idempotency_key,
         )
         spec = RequestSpec(
-            "POST", "/v1/snaps/batches", json=body, idempotent=idempotency_key is not None
+            "POST",
+            "/v1/snaps/batches",
+            json=body,
+            idempotent=idempotency_key is not None,
+            idempotency_key=idempotency_key,
         )
         return _batch_from_response(await self._client._send(spec))
 

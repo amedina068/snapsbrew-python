@@ -23,3 +23,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The
 - An error class for each failure, under `SnapsbrewError`.
 - Retries for 429, 5xx and connection errors, with exponential backoff, jitter and `Retry-After`.
 - Type hints and a `py.typed` file.
+- `ConflictError.retryable` and the code constants `IDEMPOTENCY_KEY_IN_PROGRESS`, `IDEMPOTENCY_KEY_BELONGS_TO_SNAP`, `IDEMPOTENCY_KEY_BELONGS_TO_BATCH` and `INTERNAL_ERROR`.
+- `RateLimitError.limit` and `RateLimitError.remaining`, from the `X-RateLimit-Limit` and `X-RateLimit-Remaining` headers.
+- The `Media` fields `uuid`, `name`, `mime_type`, `size`, `original_url` and `created_at`.
+
+### Changed
+
+- The client retries a 409 with the code `idempotency_key_in_progress` when the request has an `idempotency_key`. The wait is the normal backoff, as for a 429. The client does not retry the codes `idempotency_key_belongs_to_snap` and `idempotency_key_belongs_to_batch`.
+- `snaps.create()` raises `ConflictError` with the code `idempotency_key_belongs_to_batch` for a key that a batch owns. Before Snapsbrew PR #88, the instance sent a 500.
+- `snaps.create()` raises `AuthorizationError` when the instance sends 403. Before Snapsbrew PR #88, the instance sent 401 for a failed authorization.
+- `ServerError` reads the new 500 body of `POST /v1/snaps`, with the code `internal_error` and no exception text.
+- `Screenshot.image_url` is set for each item of `screenshots.list()`. Before Snapsbrew PR #88, the list read an `image_url` column that the table does not have.
+- `MediaPage` reads only the flat Laravel paginator. The `meta` shape of the old spec is gone.
+- The docstrings and the README say that a `template_id` that does not exist raises `ValidationError`, not `NotFoundError`.
+- The README says that a signed URL with a bad signature returns the placeholder image with the status 200.
+
+### Removed
+
+- `Layer.type`. The API does not send a layer type.

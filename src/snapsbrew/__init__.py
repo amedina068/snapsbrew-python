@@ -15,6 +15,10 @@ Example::
 from snapsbrew._client import AsyncSnapsbrew, Snapsbrew
 from snapsbrew._version import __version__
 from snapsbrew.errors import (
+    IDEMPOTENCY_KEY_BELONGS_TO_BATCH,
+    IDEMPOTENCY_KEY_BELONGS_TO_SNAP,
+    IDEMPOTENCY_KEY_IN_PROGRESS,
+    INTERNAL_ERROR,
     APIConnectionError,
     APIError,
     APITimeoutError,
@@ -55,6 +59,10 @@ from snapsbrew.variants import (
 )
 
 __all__ = [
+    "IDEMPOTENCY_KEY_BELONGS_TO_BATCH",
+    "IDEMPOTENCY_KEY_BELONGS_TO_SNAP",
+    "IDEMPOTENCY_KEY_IN_PROGRESS",
+    "INTERNAL_ERROR",
     "APIConnectionError",
     "APIError",
     "APITimeoutError",

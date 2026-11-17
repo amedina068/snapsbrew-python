@@ -11,7 +11,17 @@ import pytest
 import respx
 
 from snapsbrew import Hidden, Image, Snapsbrew, Text, WaitTimeoutError
-from tests.conftest import BATCH_BODY, SNAP_BODY, TEMPLATE_ID, TOKEN, SleepRecorder
+from tests.conftest import (
+    BATCH_BODY,
+    MEDIA_BODY,
+    MEDIA_PAGE_BODY,
+    SCREENSHOT_BODY,
+    SCREENSHOT_LIST_ITEM,
+    SNAP_BODY,
+    TEMPLATE_ID,
+    TOKEN,
+    SleepRecorder,
+)
 
 TEMPLATE_BODY = {
     "uuid": TEMPLATE_ID,
@@ -21,7 +31,7 @@ TEMPLATE_BODY = {
     "height": 630,
     "layers": [
         {"layer": "title", "available_modifications": {"text": "Hello"}},
-        {"layer": "shape", "available_modifications": []},
+        {"layer": "frame", "available_modifications": []},
     ],
     "published_version": 2,
     "has_unpublished_edits": True,
@@ -329,82 +339,73 @@ def test_batches_wait_raises_after_the_timeout(client: Snapsbrew, api: respx.Moc
         client.batches.wait(BATCH_BODY["uuid"], timeout=0)
 
 
-SCREENSHOT = {
-    "id": "a1b2c3",
-    "url": "https://example.com",
-    "image_url": "https://snapsbrew.test/storage/screenshots/a1b2c3.png",
-    "width": 1330,
-    "height": 780,
-    "created_at": "2026-05-01T12:00:00.000000Z",
-}
-
-
-def test_screenshots_list_reads_uuid_as_id(client: Snapsbrew, api: respx.MockRouter) -> None:
-    listed = {k: v for k, v in SCREENSHOT.items() if k != "id"} | {"uuid": "a1b2c3"}
+def test_screenshots_list_reads_uuid_as_id_and_the_image_url(
+    client: Snapsbrew, api: respx.MockRouter
+) -> None:
     api.get("/v1/screenshots").respond(
-        json={"data": [listed], "meta": {"previous_cursor": None, "next_cursor": None}}
+        json={
+            "data": [SCREENSHOT_LIST_ITEM],
+            "meta": {"previous_cursor": None, "next_cursor": None},
+        }
     )
     page = client.screenshots.list()
-    assert page.data[0].id == "a1b2c3"
+    shot = page.data[0]
+    assert shot.id == "a1b2c3"
+    assert shot.image_url == SCREENSHOT_LIST_ITEM["image_url"]
+    assert shot.created_at == datetime(2026, 5, 1, 12, 0, tzinfo=timezone.utc)
     assert next(iter(client.screenshots.iter())).width == 1330
 
 
 def test_screenshots_get(client: Snapsbrew, api: respx.MockRouter) -> None:
-    api.get("/v1/screenshots/a1b2c3").respond(json={"data": SCREENSHOT})
-    assert client.screenshots.get("a1b2c3").image_url == SCREENSHOT["image_url"]
+    api.get("/v1/screenshots/a1b2c3").respond(json={"data": SCREENSHOT_BODY})
+    assert client.screenshots.get("a1b2c3").image_url == SCREENSHOT_BODY["image_url"]
 
 
 def test_screenshots_create(client: Snapsbrew, api: respx.MockRouter) -> None:
-    route = api.post("/v1/screenshots").respond(json={"data": SCREENSHOT})
+    route = api.post("/v1/screenshots").respond(json={"data": SCREENSHOT_BODY})
     shot = client.screenshots.create("https://example.com", width=800)
     assert sent_json(route) == {"url": "https://example.com", "width": 800}
     assert shot.id == "a1b2c3"
 
 
-def test_media_list_reads_the_laravel_paginator(client: Snapsbrew, api: respx.MockRouter) -> None:
+def test_media_list_reads_the_flat_laravel_paginator(
+    client: Snapsbrew, api: respx.MockRouter
+) -> None:
+    api.get("/v1/media").respond(json=MEDIA_PAGE_BODY)
+    page = client.media.list()
+    assert (page.current_page, page.last_page, page.per_page, page.total) == (1, 1, 12, 1)
+    assert not page.has_more
+    media = page.data[0]
+    assert media.id == 12
+    assert media.uuid == MEDIA_BODY["uuid"]
+    assert media.name == "logo"
+    assert media.file_name == "logo.png"
+    assert media.mime_type == "image/png"
+    assert media.size == 20480
+    assert media.original_url == MEDIA_BODY["original_url"]
+    assert media.src == MEDIA_BODY["src"]
+    assert media.created_at == datetime(2026, 5, 1, 12, 0, tzinfo=timezone.utc)
+
+
+def test_media_list_sends_the_page(client: Snapsbrew, api: respx.MockRouter) -> None:
     route = api.get("/v1/media", params={"page": "2"}).respond(
-        json={
-            "current_page": 2,
-            "data": [{"id": 12, "file_name": "logo.png", "src": "https://x/logo.jpg"}],
-            "last_page": 3,
-            "per_page": 12,
-            "total": 30,
-        }
+        json={**MEDIA_PAGE_BODY, "current_page": 2, "last_page": 3, "total": 30}
     )
     page = client.media.list(page=2)
     assert route.called
-    assert page.data[0].id == 12
     assert page.current_page == 2
     assert page.has_more
-
-
-def test_media_list_reads_the_spec_shape(client: Snapsbrew, api: respx.MockRouter) -> None:
-    api.get("/v1/media").respond(
-        json={
-            "data": [{"id": 12, "file_name": "logo.png", "src": "https://x/logo.jpg"}],
-            "links": {"first": "...", "last": "...", "prev": None, "next": None},
-            "meta": {"current_page": 1, "per_page": 12, "total": 1},
-        }
-    )
-    page = client.media.list()
-    assert page.total == 1
-    assert not page.has_more
 
 
 def test_media_upload_from_a_path(client: Snapsbrew, api: respx.MockRouter, tmp_path: Path) -> None:
     image = tmp_path / "logo.png"
     image.write_bytes(b"\x89PNG fake")
-    route = api.post("/v1/media").respond(
-        json={
-            "id": 12,
-            "file_name": "logo.png",
-            "src": "https://x/logo.jpg",
-            "mime_type": "image/png",
-        }
-    )
+    route = api.post("/v1/media").respond(json={**MEDIA_BODY, "disk": "public"})
     media = client.media.upload(image)
     assert media.id == 12
-    assert media.raw["mime_type"] == "image/png"
+    assert media.mime_type == "image/png"
+    # A field that the model does not know stays in `raw`.
+    assert media.raw["disk"] == "public"
     request = route.calls.last.request
     assert request.headers["content-type"].startswith("multipart/form-data")
     assert b'filename="logo.png"' in request.content
