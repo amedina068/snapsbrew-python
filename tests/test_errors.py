@@ -194,6 +194,28 @@ def test_a_500_on_snap_create_is_a_server_error_with_the_generic_code(
     assert route.call_count == 1
 
 
+def test_a_500_on_batch_create_is_a_server_error_with_the_generic_code(
+    client: Snapsbrew, api: respx.MockRouter
+) -> None:
+    body = {
+        "message": "The server could not create the batch. Try again later. If the error "
+        "continues, contact support and give the X-Request-Uuid header of this response.",
+        "code": "internal_error",
+    }
+    route = api.post("/v1/snaps/batches").respond(
+        500, json=body, headers={"X-Request-Uuid": "req-batch"}
+    )
+    with pytest.raises(ServerError) as caught:
+        client.batches.create(TEMPLATE_ID, items=[[Text("title", "A")]])
+    error = caught.value
+    assert error.status_code == 500
+    assert error.code == INTERNAL_ERROR
+    assert error.message == body["message"]
+    assert error.request_id == "req-batch"
+    # A POST without an idempotency key is not retried after a 5xx.
+    assert route.call_count == 1
+
+
 def test_editor_style_code_is_kept(client: Snapsbrew, api: respx.MockRouter) -> None:
     api.get("/v1/auth").respond(409, json={"code": "legacy_edit_rejected_for_v2"})
     with pytest.raises(ConflictError) as caught:

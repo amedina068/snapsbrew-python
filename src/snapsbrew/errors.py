@@ -55,7 +55,10 @@ IDEMPOTENCY_KEY_BELONGS_TO_BATCH: Final = "idempotency_key_belongs_to_batch"
 """A single snap request sent a key that belongs to a batch. Send a new key."""
 
 INTERNAL_ERROR: Final = "internal_error"
-"""The `code` of a 500 from ``POST /v1/snaps``. The body has no exception text."""
+"""The `code` of a 500 from ``POST /v1/snaps`` and ``POST /v1/snaps/batches``.
+
+The body has no exception text.
+"""
 
 
 class SnapsbrewError(Exception):
@@ -196,8 +199,8 @@ class RateLimitError(APIError):
 class ServerError(APIError):
     """The instance had an internal error (5xx).
 
-    ``POST /v1/snaps`` sends the code :data:`INTERNAL_ERROR` and a fixed message.
-    Give ``request_id`` to support.
+    ``POST /v1/snaps`` and ``POST /v1/snaps/batches`` send the code
+    :data:`INTERNAL_ERROR` and a fixed message. Give ``request_id`` to support.
     """
 
 

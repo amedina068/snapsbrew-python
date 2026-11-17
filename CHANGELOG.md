@@ -35,6 +35,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The
 - `ServerError` reads the new 500 body of `POST /v1/snaps`, with the code `internal_error` and no exception text.
 - `Screenshot.image_url` is set for each item of `screenshots.list()`. Before Snapsbrew PR #88, the list read an `image_url` column that the table does not have.
 - `MediaPage` reads only the flat Laravel paginator. The `meta` shape of the old spec is gone.
+- The `Media` docstring says that the upload and the list send the nine fields of the model and no other field. Before Snapsbrew PR #89, the instance also sent internal fields of the media record, for example `model_type` and `disk`.
+- `Screenshot.image_url` is `None` when the capture has no stored image. Before Snapsbrew PR #89, the instance sent an empty string.
+- `ServerError` reads the 500 body of `POST /v1/snaps/batches`, with the code `internal_error`. The `INTERNAL_ERROR` docstring names both endpoints.
 - The docstrings and the README say that a `template_id` that does not exist raises `ValidationError`, not `NotFoundError`.
 - The README says that a signed URL with a bad signature returns the placeholder image with the status 200.
 

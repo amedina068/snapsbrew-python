@@ -293,7 +293,8 @@ class Screenshot:
     """A capture of a web page.
 
     ``image_url`` is the URL of the captured image. The list, the read and the
-    create all send it. It is ``None`` when the capture has no stored image.
+    create all send it. The instance sends ``null`` when the capture has no
+    stored image, and the SDK gives ``None``.
     """
 
     id: str
@@ -322,8 +323,8 @@ class Screenshot:
 class Media:
     """An image in the media library of your account.
 
-    Use ``src`` as the ``image_url`` of a variant. The API sends the stored
-    media record, so ``raw`` can hold more fields than this model.
+    Use ``src`` as the ``image_url`` of a variant. The upload and the list send
+    the nine fields of this model and no other field.
     """
 
     id: int

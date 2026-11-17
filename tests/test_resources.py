@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import fields
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -10,7 +11,7 @@ import httpx
 import pytest
 import respx
 
-from snapsbrew import Hidden, Image, Snapsbrew, Text, WaitTimeoutError
+from snapsbrew import Hidden, Image, Media, Snapsbrew, Text, WaitTimeoutError
 from tests.conftest import (
     BATCH_BODY,
     MEDIA_BODY,
@@ -361,6 +362,22 @@ def test_screenshots_get(client: Snapsbrew, api: respx.MockRouter) -> None:
     assert client.screenshots.get("a1b2c3").image_url == SCREENSHOT_BODY["image_url"]
 
 
+def test_screenshots_give_none_when_the_capture_has_no_image(
+    client: Snapsbrew, api: respx.MockRouter
+) -> None:
+    api.get("/v1/screenshots").respond(
+        json={
+            "data": [{**SCREENSHOT_LIST_ITEM, "image_url": None}],
+            "meta": {"previous_cursor": None, "next_cursor": None},
+        }
+    )
+    api.get("/v1/screenshots/a1b2c3").respond(json={"data": {**SCREENSHOT_BODY, "image_url": None}})
+    api.post("/v1/screenshots").respond(json={"data": {**SCREENSHOT_BODY, "image_url": None}})
+    assert client.screenshots.list().data[0].image_url is None
+    assert client.screenshots.get("a1b2c3").image_url is None
+    assert client.screenshots.create("https://example.com").image_url is None
+
+
 def test_screenshots_create(client: Snapsbrew, api: respx.MockRouter) -> None:
     route = api.post("/v1/screenshots").respond(json={"data": SCREENSHOT_BODY})
     shot = client.screenshots.create("https://example.com", width=800)
@@ -387,6 +404,22 @@ def test_media_list_reads_the_flat_laravel_paginator(
     assert media.created_at == datetime(2026, 5, 1, 12, 0, tzinfo=timezone.utc)
 
 
+def test_media_model_has_a_field_for_each_field_of_the_body() -> None:
+    # The instance sends nine fields and no other field.
+    assert set(MEDIA_BODY) == {
+        "id",
+        "uuid",
+        "name",
+        "file_name",
+        "mime_type",
+        "size",
+        "original_url",
+        "src",
+        "created_at",
+    }
+    assert {item.name for item in fields(Media)} - {"raw"} == set(MEDIA_BODY)
+
+
 def test_media_list_sends_the_page(client: Snapsbrew, api: respx.MockRouter) -> None:
     route = api.get("/v1/media", params={"page": "2"}).respond(
         json={**MEDIA_PAGE_BODY, "current_page": 2, "last_page": 3, "total": 30}
@@ -400,12 +433,11 @@ def test_media_list_sends_the_page(client: Snapsbrew, api: respx.MockRouter) -> 
 def test_media_upload_from_a_path(client: Snapsbrew, api: respx.MockRouter, tmp_path: Path) -> None:
     image = tmp_path / "logo.png"
     image.write_bytes(b"\x89PNG fake")
-    route = api.post("/v1/media").respond(json={**MEDIA_BODY, "disk": "public"})
+    route = api.post("/v1/media").respond(json=MEDIA_BODY)
     media = client.media.upload(image)
     assert media.id == 12
     assert media.mime_type == "image/png"
-    # A field that the model does not know stays in `raw`.
-    assert media.raw["disk"] == "public"
+    assert media.raw == MEDIA_BODY
     request = route.calls.last.request
     assert request.headers["content-type"].startswith("multipart/form-data")
     assert b'filename="logo.png"' in request.content

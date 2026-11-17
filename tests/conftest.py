@@ -60,7 +60,8 @@ SCREENSHOT_BODY: dict[str, Any] = {
     **{key: value for key, value in SCREENSHOT_LIST_ITEM.items() if key != "uuid"},
 }
 
-# The stored media record that GET and POST /v1/media send.
+# The exact body of POST /v1/media and of each item of GET /v1/media. The
+# instance sends these nine fields and no other field.
 MEDIA_BODY: dict[str, Any] = {
     "id": 12,
     "uuid": "0d4c3a1e-5b2f-4e8a-9c7d-1f2e3a4b5c6d",

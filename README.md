@@ -204,7 +204,7 @@ for shot in client.screenshots.iter():
     print(shot.id, shot.image_url)
 ```
 
-The list, the read and the create all give `image_url`, the URL of the captured image.
+The list, the read and the create all give `image_url`, the URL of the captured image. It is `None` when the capture has no stored image.
 
 ### Media
 
@@ -327,7 +327,7 @@ Each `APIError` has `status_code`, `message`, `body`, `code`, `request_id` and `
 
 In each case, the instance created nothing and used no credit.
 
-`ServerError` (5xx) from `POST /v1/snaps` has the code `INTERNAL_ERROR` and a fixed message. The body holds no details of the fault. Give `request_id` to support.
+`ServerError` (5xx) from `POST /v1/snaps` or `POST /v1/snaps/batches` has the code `INTERNAL_ERROR` and a fixed message. The body holds no details of the fault. Give `request_id` to support.
 
 ```python
 from snapsbrew import ConflictError, RateLimitError, ValidationError
