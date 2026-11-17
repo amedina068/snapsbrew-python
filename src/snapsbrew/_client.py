@@ -1,0 +1,946 @@
+"""The sync client ``Snapsbrew`` and the async client ``AsyncSnapsbrew``.
+
+The two clients have the same resources and the same methods. The functions
+at the top of this module build the requests and read the responses, so the
+two clients share all logic except the I/O.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import builtins
+import mimetypes
+import os
+import time
+from collections.abc import AsyncIterator, Iterable, Iterator, Mapping, Sequence
+from pathlib import Path
+from types import TracebackType
+from typing import IO, Any, Literal, TypeVar
+from urllib.parse import quote
+
+import httpx
+
+from snapsbrew._base import (
+    DEFAULT_MAX_RETRIES,
+    NOT_GIVEN,
+    BaseClient,
+    NotGiven,
+    RequestSpec,
+    TimeoutTypes,
+    connection_error,
+    decode_body,
+    error_from_response,
+    response_retry_delay,
+    transport_retry_delay,
+    unwrap_data,
+)
+from snapsbrew.errors import SnapsbrewError, WaitTimeoutError
+from snapsbrew.models import (
+    Account,
+    Batch,
+    Media,
+    MediaPage,
+    Page,
+    Screenshot,
+    Snap,
+    Template,
+    TemplateSize,
+)
+from snapsbrew.variants import VariantLike, to_dicts
+
+__all__ = ["AsyncSnapsbrew", "Snapsbrew"]
+
+SnapType = Literal["image", "pdf"]
+ImageFormat = Literal["png", "jpeg", "webp"]
+FileInput = str | os.PathLike[str] | bytes | IO[bytes]
+BatchItemInput = Mapping[str, Any] | Sequence[VariantLike]
+
+MAX_BATCH_ITEMS = 100
+
+_SyncClient = TypeVar("_SyncClient", bound="Snapsbrew")
+_AsyncClient = TypeVar("_AsyncClient", bound="AsyncSnapsbrew")
+
+
+# The tests replace these two functions, so that a retry does not wait.
+def _sleep(seconds: float) -> None:
+    time.sleep(seconds)
+
+
+async def _async_sleep(seconds: float) -> None:
+    await asyncio.sleep(seconds)
+
+
+# --- Request builders and response readers, shared by both clients ----------
+
+
+def _segment(value: str, name: str) -> str:
+    if not value:
+        raise ValueError(f"{name} must not be empty")
+    return quote(value, safe="")
+
+
+def _cursor_params(cursor: str | None) -> list[tuple[str, str]] | None:
+    return [("cursor", cursor)] if cursor else None
+
+
+def _object(body: Any) -> Mapping[str, Any]:
+    if not isinstance(body, dict):
+        raise SnapsbrewError(
+            "The instance sent a response that is not a JSON object. "
+            "Make sure that base_url is the URL of a Snapsbrew instance."
+        )
+    return body
+
+
+def _objects(body: Any) -> list[Mapping[str, Any]]:
+    if not isinstance(body, list):
+        raise SnapsbrewError("The instance sent a response that is not a JSON list.")
+    return [item for item in body if isinstance(item, dict)]
+
+
+def _templates_page(body: Any) -> Page[Template]:
+    body = _object(body)
+    meta = body.get("meta") if isinstance(body.get("meta"), dict) else {}
+    return Page(
+        data=tuple(Template.from_dict(item) for item in _objects(body.get("data", []))),
+        next_cursor=meta.get("next_cursor"),
+        previous_cursor=meta.get("previous_cursor"),
+    )
+
+
+def _screenshots_page(body: Any) -> Page[Screenshot]:
+    body = _object(body)
+    meta = body.get("meta") if isinstance(body.get("meta"), dict) else {}
+    return Page(
+        data=tuple(Screenshot.from_dict(item) for item in _objects(body.get("data", []))),
+        next_cursor=meta.get("next_cursor"),
+        previous_cursor=meta.get("previous_cursor"),
+    )
+
+
+def _snap_body(
+    *,
+    target: tuple[str, str],
+    variants: Iterable[VariantLike] | None,
+    type: SnapType | None,
+    format: ImageFormat | None,
+    transparent: bool | None,
+    webhook_url: str | None,
+    idempotency_key: str | None = None,
+) -> dict[str, Any]:
+    body: dict[str, Any] = {target[0]: target[1]}
+    if variants is not None:
+        body["variants"] = to_dicts(variants)
+    if type is not None:
+        body["type"] = type
+    if format is not None:
+        body["format"] = format
+    if transparent is not None:
+        body["transparent"] = transparent
+    if webhook_url is not None:
+        body["async"] = True
+        body["webhook_url"] = webhook_url
+    if idempotency_key is not None:
+        body["idempotency_key"] = idempotency_key
+    return body
+
+
+def _snap_from_response(response: httpx.Response) -> Snap:
+    return Snap.from_dict(
+        _object(unwrap_data(decode_body(response))),
+        request_id=response.headers.get("x-request-uuid"),
+        replayed=response.headers.get("x-idempotent-replay") == "true",
+    )
+
+
+def _snaps_from_response(response: httpx.Response) -> list[Snap]:
+    request_id = response.headers.get("x-request-uuid")
+    return [
+        Snap.from_dict(item, request_id=request_id)
+        for item in _objects(unwrap_data(decode_body(response)))
+    ]
+
+
+def _batch_from_response(response: httpx.Response) -> Batch:
+    return Batch.from_dict(
+        _object(unwrap_data(decode_body(response))),
+        request_id=response.headers.get("x-request-uuid"),
+        replayed=response.headers.get("x-idempotent-replay") == "true",
+    )
+
+
+def _batch_items(items: Iterable[BatchItemInput]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for index, item in enumerate(items):
+        if isinstance(item, Mapping):
+            if "layer" in item and "variants" not in item:
+                raise TypeError(
+                    f"items[{index}] is a variant. Each item is a list of variants, "
+                    'or a dict like {"identifier": "row-1", "variants": [...]}.'
+                )
+            entry: dict[str, Any] = {"variants": to_dicts(item.get("variants"))}
+            if item.get("identifier") is not None:
+                entry["identifier"] = str(item["identifier"])
+        else:
+            entry = {"variants": to_dicts(item)}
+        result.append(entry)
+    if not result:
+        raise ValueError("items must contain at least one item")
+    if len(result) > MAX_BATCH_ITEMS:
+        raise ValueError(
+            f"A batch accepts at most {MAX_BATCH_ITEMS} items, not {len(result)}. "
+            "Split the items into more batches."
+        )
+    return result
+
+
+def _batch_body(
+    *,
+    template_id: str,
+    items: Iterable[BatchItemInput],
+    title: str | None,
+    webhook_url: str | None,
+    type: SnapType | None,
+    format: ImageFormat | None,
+    transparent: bool | None,
+    idempotency_key: str | None,
+) -> dict[str, Any]:
+    body: dict[str, Any] = {"template_id": template_id, "items": _batch_items(items)}
+    optional = {
+        "title": title,
+        "webhook_url": webhook_url,
+        "type": type,
+        "format": format,
+        "transparent": transparent,
+        "idempotency_key": idempotency_key,
+    }
+    body.update({key: value for key, value in optional.items() if value is not None})
+    return body
+
+
+def _preview_params(
+    template_id: str, variants: Iterable[VariantLike] | None
+) -> list[tuple[str, str]]:
+    params = [("template_id", template_id)]
+    for index, variant in enumerate(to_dicts(variants)):
+        for key, value in variant.items():
+            if value is None:
+                continue
+            # The Laravel `boolean` rule accepts "1" and "0", not "true" and "false".
+            text = ("1" if value else "0") if isinstance(value, bool) else str(value)
+            params.append((f"variants[{index}][{key}]", text))
+    return params
+
+
+def _screenshot_body(url: str, width: int | None, height: int | None) -> dict[str, Any]:
+    body: dict[str, Any] = {"url": url}
+    if width is not None:
+        body["width"] = width
+    if height is not None:
+        body["height"] = height
+    return body
+
+
+def _upload_files(file: FileInput, filename: str | None) -> dict[str, tuple[str, bytes, str]]:
+    # The client reads the whole file before the first attempt, so that a retry
+    # sends the same bytes.
+    if isinstance(file, (str, os.PathLike)):
+        path = Path(file)
+        content = path.read_bytes()
+        name = filename or path.name
+    elif isinstance(file, bytes):
+        content = file
+        name = filename or "upload"
+    else:
+        content = file.read()
+        name = filename or Path(str(getattr(file, "name", "upload"))).name
+    mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
+    return {"file": (name, content, mime)}
+
+
+# --- The sync client ---------------------------------------------------------
+
+
+class Snapsbrew(BaseClient):
+    """A client for one Snapsbrew instance.
+
+    Example::
+
+        with Snapsbrew(base_url="https://snapsbrew.example.com", token="...") as client:
+            snap = client.snaps.create(template_id, variants=[Text("title", "Hello")])
+            print(snap.media_url)
+
+    Args:
+        base_url: The URL of your instance. The default is ``$SNAPSBREW_URL``.
+        token: An API token with the ``api_requests`` ability. The default is
+            ``$SNAPSBREW_TOKEN``.
+        timeout: Seconds, or an ``httpx.Timeout``. The default is 30 seconds.
+            ``None`` means no timeout.
+        max_retries: The number of retries after a 429, a 5xx or a connection
+            error. The default is 2. Use 0 to stop all retries.
+        http_client: Your own ``httpx.Client``, for example with a proxy. The
+            client does not close it.
+    """
+
+    def __init__(
+        self,
+        base_url: str | None = None,
+        token: str | None = None,
+        *,
+        timeout: TimeoutTypes | NotGiven = NOT_GIVEN,
+        max_retries: int = DEFAULT_MAX_RETRIES,
+        http_client: httpx.Client | None = None,
+    ) -> None:
+        super().__init__(base_url, token, timeout=timeout, max_retries=max_retries)
+        self._owns_http = http_client is None
+        self._http = http_client or httpx.Client(timeout=self._default_timeout)
+        self.templates = Templates(self)
+        self.snaps = Snaps(self)
+        self.batches = Batches(self)
+        self.screenshots = Screenshots(self)
+        self.media = MediaLibrary(self)
+        self.guides = Guides(self)
+
+    def whoami(self) -> Account:
+        """Return the account of the token (``GET /v1/auth``)."""
+        body = self._json(RequestSpec("GET", "/v1/auth", idempotent=True))
+        return Account.from_dict(_object(unwrap_data(body)))
+
+    def close(self) -> None:
+        """Close the connections. The client does not close an ``http_client`` that you gave."""
+        if self._owns_http:
+            self._http.close()
+
+    def __enter__(self: _SyncClient) -> _SyncClient:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        self.close()
+
+    def _send(self, spec: RequestSpec) -> httpx.Response:
+        attempt = 0
+        while True:
+            try:
+                response = self._http.send(self._build_request(self._http, spec))
+            except httpx.TransportError as exc:
+                delay = transport_retry_delay(exc, spec, attempt, self.max_retries)
+                if delay is None:
+                    raise connection_error(exc) from exc
+            else:
+                if response.is_success:
+                    return response
+                delay = response_retry_delay(response, spec, attempt, self.max_retries)
+                if delay is None:
+                    raise error_from_response(response)
+                response.close()
+            _sleep(delay)
+            attempt += 1
+
+    def _json(self, spec: RequestSpec) -> Any:
+        return decode_body(self._send(spec))
+
+
+class Templates:
+    """Read templates and their layers."""
+
+    def __init__(self, client: Snapsbrew) -> None:
+        self._client = client
+
+    def list(self, *, cursor: str | None = None) -> Page[Template]:
+        """Return one page of templates. Give ``page.next_cursor`` to get the next page."""
+        spec = RequestSpec("GET", "/v1/templates", params=_cursor_params(cursor), idempotent=True)
+        return _templates_page(self._client._json(spec))
+
+    def iter(self) -> Iterator[Template]:
+        """Iterate over all templates. The client gets the pages one at a time."""
+        cursor: str | None = None
+        while True:
+            page = self.list(cursor=cursor)
+            yield from page
+            if not page.next_cursor:
+                return
+            cursor = page.next_cursor
+
+    def get(self, template_id: str) -> Template:
+        """Return one template, with its layers and its publish state."""
+        path = f"/v1/templates/{_segment(template_id, 'template_id')}"
+        body = self._client._json(RequestSpec("GET", path, idempotent=True))
+        return Template.from_dict(_object(unwrap_data(body)))
+
+    def sizes(self) -> builtins.list[TemplateSize]:
+        """Return all canvas size presets."""
+        body = self._client._json(RequestSpec("GET", "/v1/templates/sizes", idempotent=True))
+        return [TemplateSize.from_dict(item) for item in _objects(unwrap_data(body))]
+
+
+class Snaps:
+    """Render snaps and preview them."""
+
+    def __init__(self, client: Snapsbrew) -> None:
+        self._client = client
+
+    def create(
+        self,
+        template_id: str,
+        variants: Iterable[VariantLike] | None = None,
+        *,
+        type: SnapType | None = None,
+        format: ImageFormat | None = None,
+        transparent: bool | None = None,
+        webhook_url: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> Snap:
+        """Render a snap from the published version of a template. Each render costs one credit.
+
+        If you give ``webhook_url``, the instance queues the render and returns
+        at once with the status ``pending``. Then it posts the result to the webhook.
+
+        If you give ``idempotency_key``, a retry with the same key returns the
+        same snap and renders nothing. The client then also retries after a 5xx
+        and after a read timeout.
+        """
+        body = _snap_body(
+            target=("template_id", template_id),
+            variants=variants,
+            type=type,
+            format=format,
+            transparent=transparent,
+            webhook_url=webhook_url,
+            idempotency_key=idempotency_key,
+        )
+        spec = RequestSpec("POST", "/v1/snaps", json=body, idempotent=idempotency_key is not None)
+        return _snap_from_response(self._client._send(spec))
+
+    def create_from_collection(
+        self,
+        collection_id: str,
+        variants: Iterable[VariantLike] | None = None,
+        *,
+        type: SnapType | None = None,
+        format: ImageFormat | None = None,
+        transparent: bool | None = None,
+        webhook_url: str | None = None,
+    ) -> list[Snap]:
+        """Render one snap for each template of a collection."""
+        body = _snap_body(
+            target=("collection_id", collection_id),
+            variants=variants,
+            type=type,
+            format=format,
+            transparent=transparent,
+            webhook_url=webhook_url,
+        )
+        response = self._client._send(RequestSpec("POST", "/v1/snaps", json=body))
+        return _snaps_from_response(response)
+
+    def preview(self, template_id: str, variants: Iterable[VariantLike] | None = None) -> str:
+        """Return a watermarked HTML preview. A preview costs no credit and stores nothing.
+
+        The instance allows 10 previews a minute for each account.
+        """
+        spec = RequestSpec(
+            "GET",
+            "/v1/snaps/preview",
+            params=_preview_params(template_id, variants),
+            idempotent=True,
+        )
+        return self._client._send(spec).text
+
+
+class Batches:
+    """Render up to 100 snaps from one template in the background."""
+
+    def __init__(self, client: Snapsbrew) -> None:
+        self._client = client
+
+    def create(
+        self,
+        template_id: str,
+        items: Iterable[BatchItemInput],
+        *,
+        title: str | None = None,
+        webhook_url: str | None = None,
+        type: SnapType | None = None,
+        format: ImageFormat | None = None,
+        transparent: bool | None = None,
+        idempotency_key: str | None = None,
+    ) -> Batch:
+        """Start a batch.
+
+        Each item is a list of variants, or a dict with ``variants`` and an
+        optional ``identifier``. The instance posts one webhook to
+        ``webhook_url`` when the batch finishes.
+        """
+        body = _batch_body(
+            template_id=template_id,
+            items=items,
+            title=title,
+            webhook_url=webhook_url,
+            type=type,
+            format=format,
+            transparent=transparent,
+            idempotency_key=idempotency_key,
+        )
+        spec = RequestSpec(
+            "POST", "/v1/snaps/batches", json=body, idempotent=idempotency_key is not None
+        )
+        return _batch_from_response(self._client._send(spec))
+
+    def get(self, batch_id: str) -> Batch:
+        """Return the counts of a batch and each item with its status and image URL."""
+        path = f"/v1/snaps/batches/{_segment(batch_id, 'batch_id')}"
+        return _batch_from_response(self._client._send(RequestSpec("GET", path, idempotent=True)))
+
+    def cancel(self, batch_id: str) -> Batch:
+        """Stop the items that did not start. You cannot undo a cancel."""
+        path = f"/v1/snaps/batches/{_segment(batch_id, 'batch_id')}/cancel"
+        # The server returns a finished batch unchanged, so a retry is safe.
+        return _batch_from_response(self._client._send(RequestSpec("POST", path, idempotent=True)))
+
+    def wait(self, batch_id: str, *, interval: float = 5.0, timeout: float | None = 600.0) -> Batch:
+        """Get the batch again each ``interval`` seconds until its status is terminal.
+
+        Raises:
+            WaitTimeoutError: The batch did not finish in ``timeout`` seconds.
+        """
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            batch = self.get(batch_id)
+            if batch.is_finished:
+                return batch
+            if deadline is not None and time.monotonic() >= deadline:
+                raise WaitTimeoutError(f"Batch {batch_id} did not finish in {timeout} seconds.")
+            _sleep(interval)
+
+
+class Screenshots:
+    """Capture web pages as images."""
+
+    def __init__(self, client: Snapsbrew) -> None:
+        self._client = client
+
+    def list(self, *, cursor: str | None = None) -> Page[Screenshot]:
+        """Return one page of screenshots."""
+        spec = RequestSpec("GET", "/v1/screenshots", params=_cursor_params(cursor), idempotent=True)
+        return _screenshots_page(self._client._json(spec))
+
+    def iter(self) -> Iterator[Screenshot]:
+        """Iterate over all screenshots."""
+        cursor: str | None = None
+        while True:
+            page = self.list(cursor=cursor)
+            yield from page
+            if not page.next_cursor:
+                return
+            cursor = page.next_cursor
+
+    def get(self, screenshot_id: str) -> Screenshot:
+        """Return one screenshot."""
+        path = f"/v1/screenshots/{_segment(screenshot_id, 'screenshot_id')}"
+        body = self._client._json(RequestSpec("GET", path, idempotent=True))
+        return Screenshot.from_dict(_object(unwrap_data(body)))
+
+    def create(
+        self, url: str, *, width: int | None = None, height: int | None = None
+    ) -> Screenshot:
+        """Capture a page. The default viewport is 1330 x 780 pixels."""
+        spec = RequestSpec("POST", "/v1/screenshots", json=_screenshot_body(url, width, height))
+        return Screenshot.from_dict(_object(unwrap_data(self._client._json(spec))))
+
+
+class MediaLibrary:
+    """Upload images to the media library and list them."""
+
+    def __init__(self, client: Snapsbrew) -> None:
+        self._client = client
+
+    def list(self, *, page: int = 1) -> MediaPage:
+        """Return one page of images, 12 for each page, newest first."""
+        spec = RequestSpec("GET", "/v1/media", params=[("page", str(page))], idempotent=True)
+        return MediaPage.from_dict(_object(self._client._json(spec)))
+
+    def upload(self, file: FileInput, *, filename: str | None = None) -> Media:
+        """Upload an image. ``file`` is a path, the bytes or a binary file object.
+
+        Give ``filename`` with bytes, so that the instance knows the image type.
+        """
+        spec = RequestSpec("POST", "/v1/media", files=_upload_files(file, filename))
+        return Media.from_dict(_object(unwrap_data(self._client._json(spec))))
+
+
+class Guides:
+    """Read the static guide catalogs. A guide call does not go into the usage log."""
+
+    def __init__(self, client: Snapsbrew) -> None:
+        self._client = client
+
+    def _get(self, path: str) -> Any:
+        return unwrap_data(self._client._json(RequestSpec("GET", path, idempotent=True)))
+
+    def design(self) -> Any:
+        """Return the design guide: canvas presets, layer order, typography and color rules."""
+        return self._get("/v1/guides/design")
+
+    def layers(self) -> Any:
+        """Return the layer schema for a template ``layers`` array."""
+        return self._get("/v1/guides/layers")
+
+    def variant_properties(self) -> Any:
+        """Return each property that a variant can set, with its value type."""
+        return self._get("/v1/guides/variant-properties")
+
+    def editor_document(self) -> Any:
+        """Return the contract of the v2 editor document."""
+        return self._get("/v1/guides/editor-document")
+
+    def platforms(self) -> Any:
+        """Return one line for each platform, with its default size preset."""
+        return self._get("/v1/guides/platforms")
+
+    def platform(self, key: str) -> Any:
+        """Return the full guide of one platform, for example ``"instagram"``."""
+        return self._get(f"/v1/guides/platforms/{_segment(key, 'key')}")
+
+    def purposes(self) -> Any:
+        """Return one line for each image purpose."""
+        return self._get("/v1/guides/purposes")
+
+    def purpose(self, key: str) -> Any:
+        """Return the full guide of one image purpose, for example ``"link_preview"``."""
+        return self._get(f"/v1/guides/purposes/{_segment(key, 'key')}")
+
+
+# --- The async client --------------------------------------------------------
+
+
+class AsyncSnapsbrew(BaseClient):
+    """The async client. It has the same resources and methods as :class:`Snapsbrew`.
+
+    Example::
+
+        async with AsyncSnapsbrew(base_url="https://snapsbrew.example.com", token="...") as client:
+            snap = await client.snaps.create(template_id, variants=[Text("title", "Hello")])
+    """
+
+    def __init__(
+        self,
+        base_url: str | None = None,
+        token: str | None = None,
+        *,
+        timeout: TimeoutTypes | NotGiven = NOT_GIVEN,
+        max_retries: int = DEFAULT_MAX_RETRIES,
+        http_client: httpx.AsyncClient | None = None,
+    ) -> None:
+        super().__init__(base_url, token, timeout=timeout, max_retries=max_retries)
+        self._owns_http = http_client is None
+        self._http = http_client or httpx.AsyncClient(timeout=self._default_timeout)
+        self.templates = AsyncTemplates(self)
+        self.snaps = AsyncSnaps(self)
+        self.batches = AsyncBatches(self)
+        self.screenshots = AsyncScreenshots(self)
+        self.media = AsyncMediaLibrary(self)
+        self.guides = AsyncGuides(self)
+
+    async def whoami(self) -> Account:
+        """Return the account of the token (``GET /v1/auth``)."""
+        body = await self._json(RequestSpec("GET", "/v1/auth", idempotent=True))
+        return Account.from_dict(_object(unwrap_data(body)))
+
+    async def aclose(self) -> None:
+        """Close the connections. The client does not close an ``http_client`` that you gave."""
+        if self._owns_http:
+            await self._http.aclose()
+
+    async def __aenter__(self: _AsyncClient) -> _AsyncClient:
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        await self.aclose()
+
+    async def _send(self, spec: RequestSpec) -> httpx.Response:
+        attempt = 0
+        while True:
+            try:
+                response = await self._http.send(self._build_request(self._http, spec))
+            except httpx.TransportError as exc:
+                delay = transport_retry_delay(exc, spec, attempt, self.max_retries)
+                if delay is None:
+                    raise connection_error(exc) from exc
+            else:
+                if response.is_success:
+                    return response
+                delay = response_retry_delay(response, spec, attempt, self.max_retries)
+                if delay is None:
+                    raise error_from_response(response)
+                await response.aclose()
+            await _async_sleep(delay)
+            attempt += 1
+
+    async def _json(self, spec: RequestSpec) -> Any:
+        return decode_body(await self._send(spec))
+
+
+class AsyncTemplates:
+    """Read templates and their layers."""
+
+    def __init__(self, client: AsyncSnapsbrew) -> None:
+        self._client = client
+
+    async def list(self, *, cursor: str | None = None) -> Page[Template]:
+        """Return one page of templates. Give ``page.next_cursor`` to get the next page."""
+        spec = RequestSpec("GET", "/v1/templates", params=_cursor_params(cursor), idempotent=True)
+        return _templates_page(await self._client._json(spec))
+
+    async def iter(self) -> AsyncIterator[Template]:
+        """Iterate over all templates. The client gets the pages one at a time."""
+        cursor: str | None = None
+        while True:
+            page = await self.list(cursor=cursor)
+            for template in page:
+                yield template
+            if not page.next_cursor:
+                return
+            cursor = page.next_cursor
+
+    async def get(self, template_id: str) -> Template:
+        """Return one template, with its layers and its publish state."""
+        path = f"/v1/templates/{_segment(template_id, 'template_id')}"
+        body = await self._client._json(RequestSpec("GET", path, idempotent=True))
+        return Template.from_dict(_object(unwrap_data(body)))
+
+    async def sizes(self) -> builtins.list[TemplateSize]:
+        """Return all canvas size presets."""
+        body = await self._client._json(RequestSpec("GET", "/v1/templates/sizes", idempotent=True))
+        return [TemplateSize.from_dict(item) for item in _objects(unwrap_data(body))]
+
+
+class AsyncSnaps:
+    """Render snaps and preview them."""
+
+    def __init__(self, client: AsyncSnapsbrew) -> None:
+        self._client = client
+
+    async def create(
+        self,
+        template_id: str,
+        variants: Iterable[VariantLike] | None = None,
+        *,
+        type: SnapType | None = None,
+        format: ImageFormat | None = None,
+        transparent: bool | None = None,
+        webhook_url: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> Snap:
+        """Render a snap. See :meth:`Snaps.create`."""
+        body = _snap_body(
+            target=("template_id", template_id),
+            variants=variants,
+            type=type,
+            format=format,
+            transparent=transparent,
+            webhook_url=webhook_url,
+            idempotency_key=idempotency_key,
+        )
+        spec = RequestSpec("POST", "/v1/snaps", json=body, idempotent=idempotency_key is not None)
+        return _snap_from_response(await self._client._send(spec))
+
+    async def create_from_collection(
+        self,
+        collection_id: str,
+        variants: Iterable[VariantLike] | None = None,
+        *,
+        type: SnapType | None = None,
+        format: ImageFormat | None = None,
+        transparent: bool | None = None,
+        webhook_url: str | None = None,
+    ) -> list[Snap]:
+        """Render one snap for each template of a collection."""
+        body = _snap_body(
+            target=("collection_id", collection_id),
+            variants=variants,
+            type=type,
+            format=format,
+            transparent=transparent,
+            webhook_url=webhook_url,
+        )
+        response = await self._client._send(RequestSpec("POST", "/v1/snaps", json=body))
+        return _snaps_from_response(response)
+
+    async def preview(self, template_id: str, variants: Iterable[VariantLike] | None = None) -> str:
+        """Return a watermarked HTML preview. A preview costs no credit."""
+        spec = RequestSpec(
+            "GET",
+            "/v1/snaps/preview",
+            params=_preview_params(template_id, variants),
+            idempotent=True,
+        )
+        return (await self._client._send(spec)).text
+
+
+class AsyncBatches:
+    """Render up to 100 snaps from one template in the background."""
+
+    def __init__(self, client: AsyncSnapsbrew) -> None:
+        self._client = client
+
+    async def create(
+        self,
+        template_id: str,
+        items: Iterable[BatchItemInput],
+        *,
+        title: str | None = None,
+        webhook_url: str | None = None,
+        type: SnapType | None = None,
+        format: ImageFormat | None = None,
+        transparent: bool | None = None,
+        idempotency_key: str | None = None,
+    ) -> Batch:
+        """Start a batch. See :meth:`Batches.create`."""
+        body = _batch_body(
+            template_id=template_id,
+            items=items,
+            title=title,
+            webhook_url=webhook_url,
+            type=type,
+            format=format,
+            transparent=transparent,
+            idempotency_key=idempotency_key,
+        )
+        spec = RequestSpec(
+            "POST", "/v1/snaps/batches", json=body, idempotent=idempotency_key is not None
+        )
+        return _batch_from_response(await self._client._send(spec))
+
+    async def get(self, batch_id: str) -> Batch:
+        """Return the counts of a batch and each item with its status and image URL."""
+        path = f"/v1/snaps/batches/{_segment(batch_id, 'batch_id')}"
+        response = await self._client._send(RequestSpec("GET", path, idempotent=True))
+        return _batch_from_response(response)
+
+    async def cancel(self, batch_id: str) -> Batch:
+        """Stop the items that did not start. You cannot undo a cancel."""
+        path = f"/v1/snaps/batches/{_segment(batch_id, 'batch_id')}/cancel"
+        response = await self._client._send(RequestSpec("POST", path, idempotent=True))
+        return _batch_from_response(response)
+
+    async def wait(
+        self, batch_id: str, *, interval: float = 5.0, timeout: float | None = 600.0
+    ) -> Batch:
+        """Get the batch again each ``interval`` seconds until its status is terminal.
+
+        Raises:
+            WaitTimeoutError: The batch did not finish in ``timeout`` seconds.
+        """
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            batch = await self.get(batch_id)
+            if batch.is_finished:
+                return batch
+            if deadline is not None and time.monotonic() >= deadline:
+                raise WaitTimeoutError(f"Batch {batch_id} did not finish in {timeout} seconds.")
+            await _async_sleep(interval)
+
+
+class AsyncScreenshots:
+    """Capture web pages as images."""
+
+    def __init__(self, client: AsyncSnapsbrew) -> None:
+        self._client = client
+
+    async def list(self, *, cursor: str | None = None) -> Page[Screenshot]:
+        """Return one page of screenshots."""
+        spec = RequestSpec("GET", "/v1/screenshots", params=_cursor_params(cursor), idempotent=True)
+        return _screenshots_page(await self._client._json(spec))
+
+    async def iter(self) -> AsyncIterator[Screenshot]:
+        """Iterate over all screenshots."""
+        cursor: str | None = None
+        while True:
+            page = await self.list(cursor=cursor)
+            for screenshot in page:
+                yield screenshot
+            if not page.next_cursor:
+                return
+            cursor = page.next_cursor
+
+    async def get(self, screenshot_id: str) -> Screenshot:
+        """Return one screenshot."""
+        path = f"/v1/screenshots/{_segment(screenshot_id, 'screenshot_id')}"
+        body = await self._client._json(RequestSpec("GET", path, idempotent=True))
+        return Screenshot.from_dict(_object(unwrap_data(body)))
+
+    async def create(
+        self, url: str, *, width: int | None = None, height: int | None = None
+    ) -> Screenshot:
+        """Capture a page. The default viewport is 1330 x 780 pixels."""
+        spec = RequestSpec("POST", "/v1/screenshots", json=_screenshot_body(url, width, height))
+        return Screenshot.from_dict(_object(unwrap_data(await self._client._json(spec))))
+
+
+class AsyncMediaLibrary:
+    """Upload images to the media library and list them."""
+
+    def __init__(self, client: AsyncSnapsbrew) -> None:
+        self._client = client
+
+    async def list(self, *, page: int = 1) -> MediaPage:
+        """Return one page of images, 12 for each page, newest first."""
+        spec = RequestSpec("GET", "/v1/media", params=[("page", str(page))], idempotent=True)
+        return MediaPage.from_dict(_object(await self._client._json(spec)))
+
+    async def upload(self, file: FileInput, *, filename: str | None = None) -> Media:
+        """Upload an image. See :meth:`MediaLibrary.upload`."""
+        spec = RequestSpec("POST", "/v1/media", files=_upload_files(file, filename))
+        return Media.from_dict(_object(unwrap_data(await self._client._json(spec))))
+
+
+class AsyncGuides:
+    """Read the static guide catalogs. A guide call does not go into the usage log."""
+
+    def __init__(self, client: AsyncSnapsbrew) -> None:
+        self._client = client
+
+    async def _get(self, path: str) -> Any:
+        return unwrap_data(await self._client._json(RequestSpec("GET", path, idempotent=True)))
+
+    async def design(self) -> Any:
+        """Return the design guide."""
+        return await self._get("/v1/guides/design")
+
+    async def layers(self) -> Any:
+        """Return the layer schema."""
+        return await self._get("/v1/guides/layers")
+
+    async def variant_properties(self) -> Any:
+        """Return each property that a variant can set."""
+        return await self._get("/v1/guides/variant-properties")
+
+    async def editor_document(self) -> Any:
+        """Return the contract of the v2 editor document."""
+        return await self._get("/v1/guides/editor-document")
+
+    async def platforms(self) -> Any:
+        """Return one line for each platform."""
+        return await self._get("/v1/guides/platforms")
+
+    async def platform(self, key: str) -> Any:
+        """Return the full guide of one platform."""
+        return await self._get(f"/v1/guides/platforms/{_segment(key, 'key')}")
+
+    async def purposes(self) -> Any:
+        """Return one line for each image purpose."""
+        return await self._get("/v1/guides/purposes")
+
+    async def purpose(self, key: str) -> Any:
+        """Return the full guide of one image purpose."""
+        return await self._get(f"/v1/guides/purposes/{_segment(key, 'key')}")

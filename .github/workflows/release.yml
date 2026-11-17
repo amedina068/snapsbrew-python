@@ -1,0 +1,41 @@
+name: Release
+
+# This workflow runs only by hand. It builds the package and keeps the files
+# as a workflow artifact. It does not publish to PyPI.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Run the tests
+        run: |
+          uv sync --locked
+          uv run pytest
+
+      - name: Build the sdist and the wheel
+        run: uv build
+
+      - name: Keep the built files
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      # To publish to PyPI later:
+      # 1. Add the repository secret PYPI_API_TOKEN.
+      # 2. Remove the comment marks from the step below.
+      #
+      # - name: Publish to PyPI
+      #   run: uv publish
+      #   env:
+      #     UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_TOKEN }}

@@ -1,0 +1,49 @@
+name: Bug report
+description: Tell us about a problem in the Python client.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not put an API token or a signing key in this form.
+        For a security problem, use the Security tab. Do not open an issue.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: Write what you did, what you expected and what occurred.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Code to make the problem occur
+      description: Give the smallest code that shows the problem.
+      render: python
+    validations:
+      required: true
+  - type: textarea
+    id: error
+    attributes:
+      label: Error and traceback
+      description: Paste the full error. Include the `request_id` of an APIError, if you have it.
+      render: text
+  - type: input
+    id: package-version
+    attributes:
+      label: Package version
+      placeholder: "0.1.0"
+    validations:
+      required: true
+  - type: input
+    id: python-version
+    attributes:
+      label: Python version
+      placeholder: "3.12.4"
+    validations:
+      required: true
+  - type: input
+    id: httpx-version
+    attributes:
+      label: httpx version
+      placeholder: "0.28.1"
