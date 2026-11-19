@@ -4,6 +4,8 @@ The Python client for Snapsbrew. Snapsbrew renders images ("snaps") from templat
 
 Snapsbrew is self-hosted. Each client connects to one Snapsbrew instance, so the URL of your instance is a required setting.
 
+Read the overview of all Snapsbrew SDKs at <https://snapsbrew.com/docs/sdks/overview>.
+
 ```python
 from snapsbrew import Snapsbrew, Text, Image
 
@@ -25,6 +27,7 @@ print(snap.media_url)
 - [Resources](#resources)
 - [Async client](#async-client)
 - [Signed URLs](#signed-urls)
+- [Webhooks](#webhooks)
 - [Errors](#errors)
 - [Retries](#retries)
 - [Django and FastAPI](#django-and-fastapi)
@@ -39,6 +42,8 @@ pip install "git+https://github.com/amedina068/snapsbrew-python.git"
 # or
 uv add "git+https://github.com/amedina068/snapsbrew-python.git"
 ```
+
+The repository is private. Git must have access to it, for example with an SSH key or with `gh auth setup-git`. To install a fixed commit, add `@<commit>` to the URL.
 
 The package has one dependency: [httpx](https://www.python-httpx.org/).
 
@@ -57,13 +62,13 @@ The package has one dependency: [httpx](https://www.python-httpx.org/).
                print("  ", layer.layer, layer.available_modifications)
    ```
 
-3. Preview the snap. A preview is free. It returns watermarked HTML and stores nothing:
+3. Preview the snap. A preview returns watermarked HTML and stores nothing:
 
    ```python
    html = client.snaps.preview(template_id, variants=[Text("title", "Hello")])
    ```
 
-4. Render the snap. Each render costs one credit:
+4. Render the snap:
 
    ```python
    snap = client.snaps.create(template_id, variants=[Text("title", "Hello")])
@@ -144,6 +149,78 @@ template = client.templates.get(template_id)  # layers and publish state
 sizes = client.templates.sizes()  # canvas size presets
 ```
 
+Write and publish a template:
+
+```python
+summary = client.templates.create(
+    "Launch card",
+    size="open_graph",  # or width=1200, height=630
+    layers=[{"key": "title", "type": "text", "properties": [{"name": "text", "value": "Hi"}]}],
+    groups=[{"id": "header", "name": "Header", "visible": True, "order": 0}],
+)
+summary = client.templates.update(summary.uuid, title="Launch card v2")  # title is required
+summary = client.templates.update(summary.uuid, title="Launch card v2", groups=None)  # no groups
+published = client.templates.publish(summary.uuid)  # snaps render this version
+html = client.templates.preview(summary.uuid, [Text("title", "Hello")])
+tags = client.templates.set_tags(summary.uuid, [1, 2])  # replaces all tags
+client.templates.delete(summary.uuid)
+```
+
+- `guides.layers()` gives the layer vocabulary. `LayerDefinition` and `LayerGroup` give the shapes for a type checker.
+- `create()` and `update()` return a `TemplateSummary` with `uuid`, `title`, `size`, `width`, `height` and `created_at`. A write that sends `size` sets the width and the height.
+- In `update()`, a field that you do not give keeps its value. `groups=None` removes each group.
+- `update()` and `delete()` accept the UUID or the numeric id of the template.
+- `update()` raises `ConflictError` with the code `LEGACY_EDIT_REJECTED_FOR_V2` for a template that uses the v2 editor document. Use `client.documents` for it.
+- Snaps render only the published version. A repeat of `publish()` with no new edits creates no new version.
+
+> **CAUTION:** `delete()` also deletes the snaps, the images, the versions and the forms of the template. You cannot undo it.
+
+### Editor documents
+
+`client.documents` reads and writes the v2 editor document of a template. Each write sends the `revision` of your last read:
+
+```python
+from snapsbrew import ConflictError
+
+current = client.documents.get(template_id)  # current.document is None when there is no draft
+try:
+    current = client.documents.apply(
+        template_id,
+        revision=current.revision,
+        operations=[
+            {
+                "operation": "set_layer_property",
+                "layer_key": "title",
+                "property": "fontWeight",
+                "value": 700,
+            },
+            {"operation": "set_layer_type", "layer_key": "logo", "type": "image"},
+        ],
+    )
+except ConflictError as error:
+    # Another write changed the document. Apply your change again to error.current_document.
+    print(error.current_revision, error.current_document)
+
+current = client.documents.replace(template_id, revision=current.revision, document=new_document)
+preflight = client.documents.preflight(template_id)
+for issue in preflight.issues:  # preflight.ok is True when the list is empty
+    print(issue.code, issue.path, issue.message)
+```
+
+- `apply()` takes 1 to 100 operations. They all apply, or none applies.
+- `replace()` sends the whole document. A layer or a property that you leave out is removed.
+- If the document refuses an operation, `apply()` raises `ValidationError`. Its `code` names the rule, for example `editor_operation_layer_not_found`, and `errors` is empty.
+- The client does not retry a document write.
+- Run `preflight()` before `templates.publish()`. An empty list does not prove that the render looks correct.
+
+### Tags
+
+```python
+tags = client.tags.list(search="launch")  # up to 15 tags, sorted by name
+tag = client.tags.create("Launch")  # the instance makes the slug
+client.templates.set_tags(template_id, [tag.id])
+```
+
 ### Snaps
 
 ```python
@@ -156,7 +233,7 @@ snap = client.snaps.create(template_id, variants, webhook_url="https://example.c
 # Render one snap for each template of a collection.
 snaps = client.snaps.create_from_collection(collection_id, variants)
 
-# Free, watermarked HTML preview. The instance allows 10 previews a minute.
+# Watermarked HTML preview. It stores nothing. The instance allows 10 previews a minute.
 html = client.snaps.preview(template_id, variants)
 ```
 
@@ -171,6 +248,17 @@ snap = client.snaps.create(template_id, variants, idempotency_key="order-1042-ca
 A key belongs to one kind of request. A key that a batch used raises `ConflictError` on `snaps.create()`, and the reverse is also true. Use a new key for each kind.
 
 A `template_id` that does not exist in your company raises `ValidationError` with `errors["template_id"]`, not `NotFoundError`.
+
+`snap.last_error` is `None`, or one of these codes:
+
+| Code | Constant | Cause |
+|---|---|---|
+| `render_failed` | `RENDER_FAILED` | The render failed. The status is `failed`. |
+| `webhook_redirect_refused` | `WEBHOOK_REDIRECT_REFUSED` | The webhook receiver sent a redirect. The instance does not follow it. |
+| `webhook_unreachable` | `WEBHOOK_UNREACHABLE` | The instance did not get a response from the webhook receiver. |
+| `webhook_http_<status>` | `WEBHOOK_HTTP_PREFIX` | The webhook receiver sent this error status, for example `webhook_http_500`. |
+
+A webhook code means that the snap rendered, but the webhook did not arrive. `batch_item.last_error` is `None` or `render_failed`.
 
 ### Batches
 
@@ -206,6 +294,8 @@ for shot in client.screenshots.iter():
 
 The list, the read and the create all give `image_url`, the URL of the captured image. It is `None` when the capture has no stored image.
 
+The instance accepts a `width` and a `height` of 1 to 4000 pixels. The client does not check them. The instance sends `ValidationError` for another value.
+
 ### Media
 
 ```python
@@ -216,6 +306,8 @@ print(media.src)  # use this URL as the image_url of a variant
 ```
 
 A `Media` has `id`, `uuid`, `name`, `file_name`, `mime_type`, `size`, `original_url`, `src` and `created_at`.
+
+The instance accepts JPG, JPEG, PNG, GIF, WebP and BMP files of 10 MB maximum. It refuses SVG. The client does not check the file. The instance sends `ValidationError` for a file that breaks a rule.
 
 ### Guides
 
@@ -232,9 +324,20 @@ client.guides.purposes()
 client.guides.purpose("link_preview")
 ```
 
+A platform or a purpose that does not exist raises `NotFoundError`. Its `available` has the valid keys:
+
+```python
+from snapsbrew import NotFoundError
+
+try:
+    client.guides.platform("myspace")
+except NotFoundError as error:
+    print(error.available)  # ["instagram", "facebook", "x", ...]
+```
+
 ### Response models
 
-Each response is a frozen dataclass: `Account`, `Template`, `Layer`, `TemplateSize`, `Snap`, `Batch`, `BatchItem`, `Screenshot`, `Media`, `Page` and `MediaPage`. The `raw` field of a model holds the JSON object from the instance. Use it to read a field that this version of the package does not know.
+Each response is a frozen dataclass: `Account`, `Template`, `TemplateSummary`, `PublishedTemplate`, `Layer`, `TemplateSize`, `EditorDocument`, `Preflight`, `PreflightIssue`, `Tag`, `Snap`, `Batch`, `BatchItem`, `Screenshot`, `Media`, `Page` and `MediaPage`. The `raw` field of a model holds the JSON object from the instance. Use it to read a field that this version of the package does not know.
 
 ## Async client
 
@@ -285,13 +388,82 @@ url = signed_url(
 |---|---|
 | `format` | `"png"` (default), `"jpeg"` or `"webp"`. |
 | `transparent` | `True` for a transparent background. PNG and WebP only. |
-| `params` | Other query parameters. The renderer ignores them, but they are part of the signature and of the cache key. To get a new image for the same content, add a value, for example `{"v": 2}`. |
+| `params` | Other query parameters. The renderer ignores them, but they are part of the signature and of the cache key. To get a new image for the same content, add a value, for example `{"v": 2}`. The names `identifier` and `api_log_uuid` are reserved. The builder refuses them. |
 
-The instance keeps each image in a cache by its full URL. The same URL returns the same image and costs no new credit. If you publish a new version of the template, the instance renders the image again.
+The instance keeps each image in a cache by its full URL. The same URL returns the same image and does not render it again. If you publish a new version of the template, the instance renders the image again.
 
-A URL with a bad signature, or for a template that does not exist, does not return an error status. The instance returns its placeholder image with the status 200. If you see the placeholder, make sure that the key belongs to the owner of the template.
+A signed URL accepts any active signed URL key of the company that owns the template.
+
+A URL with a bad signature, or for a template that does not exist, does not return an error status. The instance returns its placeholder image with the status 200. If you see the placeholder, make sure that the key belongs to the company of the template. A reserved parameter in the URL gets the status 400. Too many requests get the status 429.
 
 The signature is the HMAC-SHA256 hex digest of the query parameters, without `signature`. The parameters are sorted by key and joined as `key=value` with `&`. The `variants` value is standard base64 of the JSON array. `sign()`, `canonical_string()` and `encode_variants()` give each step, if you need them.
+
+## Webhooks
+
+An async snap and a batch post a webhook to their `webhook_url`. The instance signs each webhook with the webhook signing secret of your company. **Account > Developers** shows the secret and rotates it.
+
+> **WARNING:** The webhook signing secret is a secret. Verify webhooks only on your server. Do not send the secret to a browser.
+
+```python
+from snapsbrew import SNAP_COMPLETED, SNAP_FAILED, WebhookVerificationError, verify_webhook
+
+try:
+    event = verify_webhook(raw_body, headers, secret)
+except WebhookVerificationError as error:
+    print(error.reason)  # "signature", "timestamp" or "delivery"
+    raise
+
+if event.type == SNAP_COMPLETED:
+    print(event.snap.media_url)
+elif event.type == SNAP_FAILED:
+    print(event.snap.last_error)  # "render_failed"
+```
+
+1. Give the raw request body, byte for byte. Do not parse the JSON and encode it again. The instance escapes `/` and non-ASCII characters, so a new encoding gives other bytes.
+2. Give the request headers. The header names are not case-sensitive.
+3. Give the full secret, with its `whsec_` prefix.
+
+`verify_webhook()` compares the signature in constant time. It refuses a timestamp that is more than 300 seconds from the current time. To change this limit, give `tolerance` in seconds. In a test, give `now` as the current Unix time:
+
+```python
+event = verify_webhook(raw_body, headers, secret, tolerance=600)
+event = verify_webhook(raw_body, headers, secret, now=1767225600)
+```
+
+`verify_webhook()` returns a `WebhookEvent`:
+
+| Field | Value |
+|---|---|
+| `type` | The `event` field of the body. |
+| `delivery_id` | The `X-Snapsbrew-Delivery` header. All attempts of one delivery have the same value. |
+| `timestamp` | The `X-Snapsbrew-Timestamp` header, in Unix seconds. |
+| `data` | The decoded body. |
+| `snap` | A `Snap`, for a `snap.*` event. Else `None`. |
+| `batch` | A `Batch` with the counts, for a `snap-import.*` event. Else `None`. |
+
+The instance can send one delivery more than one time. Keep each `delivery_id` and ignore a delivery that you received before.
+
+| Event | Constant | Body |
+|---|---|---|
+| `snap.completed` | `SNAP_COMPLETED` | `snap` |
+| `snap.failed` | `SNAP_FAILED` | `snap`, with `status` `failed`, `last_error` `render_failed` and an empty `media_url` |
+| `snap-import.completed` | `SNAP_IMPORT_COMPLETED` | `import` (the batch counts) and `template` (`uuid` and `title`) |
+| `snap-import.failed` | `SNAP_IMPORT_FAILED` | `import` and `template` |
+| `snap-import.canceled` | `SNAP_IMPORT_CANCELED` | `import` and `template` |
+
+For a failed snap, `event.snap.media_url` is `None`. A new instance version can send a new event. Make your code accept an event type that it does not know.
+
+To make a signed webhook in your own tests, use `sign()`:
+
+```python
+from snapsbrew.webhooks import sign
+
+headers = {
+    "X-Snapsbrew-Delivery": "3f2b6c1e-8a4d-4e5f-9b0a-1c2d3e4f5a6b",
+    "X-Snapsbrew-Timestamp": "1767225600",
+    "X-Snapsbrew-Signature": sign("1767225600", body, "whsec_test"),
+}
+```
 
 ## Errors
 
@@ -305,17 +477,20 @@ SnapsbrewError
 │   ├── BadRequestError       400
 │   ├── AuthenticationError   401: the token is missing or not valid
 │   ├── AuthorizationError    403: the token cannot do this action
-│   ├── NotFoundError         404
-│   ├── ConflictError         409: .code tells the cause, .retryable tells if a repeat can work
-│   ├── ValidationError       422: .errors has the field errors
+│   ├── NotFoundError         404: .available has the valid guide keys
+│   ├── ConflictError         409: .code, .retryable, .current_revision, .current_document
+│   ├── ValidationError       422: .errors has the field errors, .code has a rule code
 │   ├── RateLimitError        429: .retry_after, .limit and .remaining
 │   └── ServerError           5xx
-└── WaitTimeoutError          batches.wait() did not see a terminal status in time
+├── WaitTimeoutError          batches.wait() did not see a terminal status in time
+└── WebhookVerificationError  .reason is "signature", "timestamp" or "delivery"
 ```
 
 Each `APIError` has `status_code`, `message`, `body`, `code`, `request_id` and `response`. Give `request_id` to support when you report a problem.
 
-`AuthorizationError` (403) means that the token has no `api_requests` ability, or that a permission check refused the action. `POST /v1/snaps` sends 403 for both cases.
+`AuthorizationError` (403) means that the token has no `api_requests` ability, or that a permission check refused the action. Each operation can send 403. For a token without the ability, the message is `Invalid ability provided.`
+
+`NotFoundError` (404) means that the record does not exist in your company. Do not read its message to find the cause. The text can change.
 
 `ConflictError` (409) has a `code`. The package exports a constant for each code:
 
@@ -324,8 +499,10 @@ Each `APIError` has `status_code`, `message`, `body`, `code`, `request_id` and `
 | `IDEMPOTENCY_KEY_IN_PROGRESS` | Another request with the same key runs now. | Yes, with the same key. The client retries it. |
 | `IDEMPOTENCY_KEY_BELONGS_TO_BATCH` | `snaps.create()` sent a key that a batch owns. | No. Send a new key. |
 | `IDEMPOTENCY_KEY_BELONGS_TO_SNAP` | `batches.create()` sent a key that a single snap owns. | No. Send a new key. |
+| `EDITOR_DOCUMENT_CONFLICT` | Another write changed the editor document after your last read. | Yes, after you apply your change to `current_document` and send `current_revision`. |
+| `LEGACY_EDIT_REJECTED_FOR_V2` | `templates.update()` on a template that uses the v2 editor document. | No. Use `client.documents`. |
 
-In each case, the instance created nothing and used no credit.
+In each case, the instance saved nothing.
 
 `ServerError` (5xx) from `POST /v1/snaps` or `POST /v1/snaps/batches` has the code `INTERNAL_ERROR` and a fixed message. The body holds no details of the fault. Give `request_id` to support.
 
@@ -350,7 +527,7 @@ An argument that breaks a rule of the API before the request, for example an emp
 
 The client retries a failed request two times by default. The wait before each retry grows exponentially (0.5, 1, 2 ... seconds, 8 seconds maximum) and has random jitter.
 
-| Failure | GET, and POST with `idempotency_key` | POST without `idempotency_key` |
+| Failure | GET, and POST with `idempotency_key` | Other POST, PUT and PATCH |
 |---|---|---|
 | 429 | Retry | Retry |
 | 409 `idempotency_key_in_progress` | Retry (POST with a key only) | No retry |
@@ -364,7 +541,8 @@ The client retries a failed request two times by default. The wait before each r
 - If `Retry-After` is more than 60 seconds, the client does not wait. It raises `RateLimitError` at once.
 - The API allows 60 requests per minute for one user. A preview also has a limit of 10 per minute. Each response has the headers `X-RateLimit-Limit` and `X-RateLimit-Remaining`.
 - If another request holds the same idempotency key, the client waits with the normal backoff and sends the request again. If the other request does not finish before the last retry, the client raises `ConflictError`.
-- `batches.cancel()` is idempotent, so the client retries it like a GET.
+- `batches.cancel()`, `templates.publish()`, `templates.set_tags()` and `templates.delete()` are idempotent, so the client retries them like a GET.
+- The client does not retry `templates.create()`, `templates.update()`, `tags.create()` or an editor document write after a 5xx or a read timeout.
 - Set `max_retries=0` to stop all retries.
 
 ## Django and FastAPI
@@ -408,6 +586,33 @@ Use the tag in a template. Django escapes the URL in the attribute:
 <meta property="og:image" content="{% snap_image 'TEMPLATE_UUID' title=post.title %}">
 ```
 
+### Django: a view that receives webhooks
+
+Put the secret in `settings.py` as `SNAPSBREW_WEBHOOK_SECRET`. The instance does not send a CSRF token, so the view must be `csrf_exempt`:
+
+```python
+from django.conf import settings
+from django.http import HttpRequest, HttpResponse, HttpResponseBadRequest
+from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.http import require_POST
+from snapsbrew import SNAP_COMPLETED, WebhookVerificationError, verify_webhook
+
+
+@csrf_exempt
+@require_POST
+def snapsbrew_webhook(request: HttpRequest) -> HttpResponse:
+    try:
+        event = verify_webhook(request.body, request.headers, settings.SNAPSBREW_WEBHOOK_SECRET)
+    except WebhookVerificationError:
+        return HttpResponseBadRequest()
+
+    if event.type == SNAP_COMPLETED and not already_seen(event.delivery_id):
+        save_image(event.snap.id, event.snap.media_url)
+    return HttpResponse(status=204)
+```
+
+`request.body` is the raw body, and `request.headers` is not case-sensitive.
+
 ### FastAPI: one client for the application
 
 Make one `AsyncSnapsbrew` when the application starts, and close it when the application stops. Then give it to each route with dependency injection:
@@ -446,6 +651,29 @@ async def create_card(title: str, snapsbrew: SnapsbrewClient) -> dict[str, str |
 ```
 
 In a test, replace the dependency with `app.dependency_overrides[get_snapsbrew]`.
+
+Receive webhooks in a route. Read the raw body with `await request.body()`:
+
+```python
+import os
+
+from fastapi import HTTPException, Request, Response
+from snapsbrew import SNAP_COMPLETED, WebhookVerificationError, verify_webhook
+
+WEBHOOK_SECRET = os.environ["SNAPSBREW_WEBHOOK_SECRET"]
+
+
+@app.post("/hooks/snapsbrew", status_code=204)
+async def snapsbrew_webhook(request: Request) -> Response:
+    try:
+        event = verify_webhook(await request.body(), request.headers, WEBHOOK_SECRET)
+    except WebhookVerificationError as error:
+        raise HTTPException(status_code=400, detail=error.reason) from error
+
+    if event.type == SNAP_COMPLETED and not already_seen(event.delivery_id):
+        save_image(event.snap.id, event.snap.media_url)
+    return Response(status_code=204)
+```
 
 ## Supported Python versions
 

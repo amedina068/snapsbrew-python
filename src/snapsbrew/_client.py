@@ -38,14 +38,20 @@ from snapsbrew.errors import SnapsbrewError, WaitTimeoutError
 from snapsbrew.models import (
     Account,
     Batch,
+    EditorDocument,
     Media,
     MediaPage,
     Page,
+    Preflight,
+    PublishedTemplate,
     Screenshot,
     Snap,
+    Tag,
     Template,
     TemplateSize,
+    TemplateSummary,
 )
+from snapsbrew.params import EditorOperation, LayerDefinition, LayerGroup
 from snapsbrew.variants import VariantLike, to_dicts
 
 __all__ = ["AsyncSnapsbrew", "Snapsbrew"]
@@ -54,6 +60,10 @@ SnapType = Literal["image", "pdf"]
 ImageFormat = Literal["png", "jpeg", "webp"]
 FileInput = str | os.PathLike[str] | bytes | IO[bytes]
 BatchItemInput = Mapping[str, Any] | Sequence[VariantLike]
+# The typed shapes, or plain dicts, for example from a JSON file.
+Layers = Sequence[LayerDefinition | Mapping[str, Any]]
+Groups = Sequence[LayerGroup | Mapping[str, Any]]
+Operations = Sequence[EditorOperation | Mapping[str, Any]]
 
 MAX_BATCH_ITEMS = 100
 
@@ -218,10 +228,8 @@ def _batch_body(
     return body
 
 
-def _preview_params(
-    template_id: str, variants: Iterable[VariantLike] | None
-) -> list[tuple[str, str]]:
-    params = [("template_id", template_id)]
+def _variant_params(variants: Iterable[VariantLike] | None) -> list[tuple[str, str]]:
+    params = []
     for index, variant in enumerate(to_dicts(variants)):
         for key, value in variant.items():
             if value is None:
@@ -230,6 +238,45 @@ def _preview_params(
             text = ("1" if value else "0") if isinstance(value, bool) else str(value)
             params.append((f"variants[{index}][{key}]", text))
     return params
+
+
+def _preview_params(
+    template_id: str, variants: Iterable[VariantLike] | None
+) -> list[tuple[str, str]]:
+    return [("template_id", template_id), *_variant_params(variants)]
+
+
+def _template_path(template_id: str | int, suffix: str = "") -> str:
+    # The update and the delete also accept the numeric id of the template.
+    return f"/v1/templates/{_segment(str(template_id), 'template_id')}{suffix}"
+
+
+def _template_body(
+    *,
+    title: str,
+    size: str | None,
+    width: int | None,
+    height: int | None,
+    layers: Layers | None,
+    groups: Groups | NotGiven | None,
+) -> dict[str, Any]:
+    body: dict[str, Any] = {"title": title}
+    optional = {"size": size, "width": width, "height": height}
+    body.update({key: value for key, value in optional.items() if value is not None})
+    if layers is not None:
+        body["layers"] = [dict(layer) for layer in layers]
+    # On an update, `groups=None` removes each group, so None is sent.
+    if not isinstance(groups, NotGiven):
+        body["groups"] = None if groups is None else [dict(group) for group in groups]
+    return body
+
+
+def _summary(body: Any) -> TemplateSummary:
+    return TemplateSummary.from_dict(_object(unwrap_data(body)))
+
+
+def _tags(items: Any) -> list[Tag]:
+    return [Tag.from_dict(item) for item in _objects(items)]
 
 
 def _screenshot_body(url: str, width: int | None, height: int | None) -> dict[str, Any]:
@@ -295,6 +342,8 @@ class Snapsbrew(BaseClient):
         self._owns_http = http_client is None
         self._http = http_client or httpx.Client(timeout=self._default_timeout)
         self.templates = Templates(self)
+        self.documents = Documents(self)
+        self.tags = Tags(self)
         self.snaps = Snaps(self)
         self.batches = Batches(self)
         self.screenshots = Screenshots(self)
@@ -346,7 +395,7 @@ class Snapsbrew(BaseClient):
 
 
 class Templates:
-    """Read templates and their layers."""
+    """Read, write and publish templates."""
 
     def __init__(self, client: Snapsbrew) -> None:
         self._client = client
@@ -377,6 +426,161 @@ class Templates:
         body = self._client._json(RequestSpec("GET", "/v1/templates/sizes", idempotent=True))
         return [TemplateSize.from_dict(item) for item in _objects(unwrap_data(body))]
 
+    def create(
+        self,
+        title: str,
+        *,
+        size: str | None = None,
+        width: int | None = None,
+        height: int | None = None,
+        layers: Layers | None = None,
+        groups: Groups | None = None,
+    ) -> TemplateSummary:
+        """Create a template. Give a ``size`` preset, or a ``width`` and a ``height``.
+
+        ``guides.layers()`` gives the layer vocabulary. With no ``layers``, the
+        canvas is empty. Snaps render a template only after :meth:`publish`.
+        """
+        body = _template_body(
+            title=title,
+            size=size,
+            width=width,
+            height=height,
+            layers=layers,
+            groups=NOT_GIVEN if groups is None else groups,
+        )
+        return _summary(self._client._json(RequestSpec("POST", "/v1/templates", json=body)))
+
+    def update(
+        self,
+        template_id: str | int,
+        *,
+        title: str,
+        size: str | None = None,
+        width: int | None = None,
+        height: int | None = None,
+        layers: Layers | None = None,
+        groups: Groups | NotGiven | None = NOT_GIVEN,
+    ) -> TemplateSummary:
+        """Change a template. The instance requires ``title`` on each update.
+
+        A field that you do not give keeps its value. ``groups=None`` removes
+        each group. ``template_id`` is the UUID or the numeric id.
+
+        Raises:
+            ConflictError: The template uses the v2 editor document. The code is
+                ``legacy_edit_rejected_for_v2``. Use :attr:`Snapsbrew.documents`.
+        """
+        body = _template_body(
+            title=title, size=size, width=width, height=height, layers=layers, groups=groups
+        )
+        spec = RequestSpec("PATCH", _template_path(template_id), json=body)
+        return _summary(self._client._json(spec))
+
+    def delete(self, template_id: str | int) -> None:
+        """Delete a template. You cannot undo a delete.
+
+        The instance also deletes the snaps, the images, the versions and the
+        forms of the template. ``template_id`` is the UUID or the numeric id.
+        """
+        self._client._send(RequestSpec("DELETE", _template_path(template_id), idempotent=True))
+
+    def publish(self, template_id: str) -> PublishedTemplate:
+        """Publish the draft as a new version. Snaps and previews render only this version.
+
+        A repeat with no new edits returns the live version and creates no new version.
+        """
+        spec = RequestSpec("POST", _template_path(template_id, "/publish"), idempotent=True)
+        return PublishedTemplate.from_dict(_object(unwrap_data(self._client._json(spec))))
+
+    def preview(self, template_id: str, variants: Iterable[VariantLike] | None = None) -> str:
+        """Return a watermarked HTML preview of the published version. A preview stores nothing."""
+        spec = RequestSpec(
+            "GET",
+            _template_path(template_id, "/preview"),
+            params=_variant_params(variants),
+            idempotent=True,
+        )
+        return self._client._send(spec).text
+
+    def set_tags(self, template_id: str, tag_ids: Iterable[int]) -> builtins.list[Tag]:
+        """Replace all tags of a template. An empty list removes each tag."""
+        spec = RequestSpec(
+            "POST",
+            _template_path(template_id, "/tags"),
+            json={"tag_ids": list(tag_ids)},
+            idempotent=True,
+        )
+        return _tags(_object(self._client._json(spec)).get("tags"))
+
+
+class Documents:
+    """Read and write the v2 editor document of a template.
+
+    Each write sends the ``revision`` of your last read. If another write
+    changed the document after that read, the instance saves nothing and the
+    client raises :class:`ConflictError` with ``current_revision`` and
+    ``current_document``. The client does not retry a write.
+    """
+
+    def __init__(self, client: Snapsbrew) -> None:
+        self._client = client
+
+    def get(self, template_id: str) -> EditorDocument:
+        """Return the document and its revision. Read it before each write."""
+        spec = RequestSpec("GET", _template_path(template_id, "/document"), idempotent=True)
+        return EditorDocument.from_dict(_object(self._client._json(spec)))
+
+    def replace(
+        self, template_id: str, *, revision: int, document: Mapping[str, Any]
+    ) -> EditorDocument:
+        """Replace the whole document. A layer or a property that you leave out is removed."""
+        spec = RequestSpec(
+            "PUT",
+            _template_path(template_id, "/document"),
+            json={"revision": revision, "document": dict(document)},
+        )
+        return EditorDocument.from_dict(_object(self._client._json(spec)))
+
+    def apply(self, template_id: str, *, revision: int, operations: Operations) -> EditorDocument:
+        """Apply 1 to 100 operations. They all apply, or none applies.
+
+        Raises:
+            ValidationError: The document refused an operation. Read ``code``,
+                for example ``"editor_operation_layer_not_found"``.
+        """
+        spec = RequestSpec(
+            "PATCH",
+            _template_path(template_id, "/document"),
+            json={"revision": revision, "operations": [dict(item) for item in operations]},
+        )
+        return EditorDocument.from_dict(_object(self._client._json(spec)))
+
+    def preflight(self, template_id: str) -> Preflight:
+        """Return the known problems of the stored document. Run it before you publish."""
+        path = _template_path(template_id, "/document/preflight")
+        return Preflight.from_dict(
+            _object(self._client._json(RequestSpec("GET", path, idempotent=True)))
+        )
+
+
+class Tags:
+    """List and create the tags of your company."""
+
+    def __init__(self, client: Snapsbrew) -> None:
+        self._client = client
+
+    def list(self, *, search: str | None = None) -> builtins.list[Tag]:
+        """Return up to 15 tags, sorted by name. ``search`` matches a part of the name."""
+        params = [("search", search)] if search else None
+        body = self._client._json(RequestSpec("GET", "/v1/tags", params=params, idempotent=True))
+        return _tags(unwrap_data(body))
+
+    def create(self, name: str) -> Tag:
+        """Create a tag. The instance makes the slug from the name."""
+        body = self._client._json(RequestSpec("POST", "/v1/tags", json={"name": name}))
+        return Tag.from_dict(_object(unwrap_data(body)))
+
 
 class Snaps:
     """Render snaps and preview them."""
@@ -395,7 +599,7 @@ class Snaps:
         webhook_url: str | None = None,
         idempotency_key: str | None = None,
     ) -> Snap:
-        """Render a snap from the published version of a template. Each render costs one credit.
+        """Render a snap from the published version of a template.
 
         If you give ``webhook_url``, the instance queues the render and returns
         at once with the status ``pending``. Then it posts the result to the webhook.
@@ -457,7 +661,7 @@ class Snaps:
         return _snaps_from_response(response)
 
     def preview(self, template_id: str, variants: Iterable[VariantLike] | None = None) -> str:
-        """Return a watermarked HTML preview. A preview costs no credit and stores nothing.
+        """Return a watermarked HTML preview. A preview stores nothing.
 
         The instance allows 10 previews a minute for each account.
         """
@@ -575,7 +779,11 @@ class Screenshots:
     def create(
         self, url: str, *, width: int | None = None, height: int | None = None
     ) -> Screenshot:
-        """Capture a page. The default viewport is 1330 x 780 pixels."""
+        """Capture a page. The default viewport is 1330 x 780 pixels.
+
+        The instance accepts a ``width`` and a ``height`` of 1 to 4000 pixels.
+        It sends :class:`ValidationError` for another value.
+        """
         spec = RequestSpec("POST", "/v1/screenshots", json=_screenshot_body(url, width, height))
         return Screenshot.from_dict(_object(unwrap_data(self._client._json(spec))))
 
@@ -595,6 +803,9 @@ class MediaLibrary:
         """Upload an image. ``file`` is a path, the bytes or a binary file object.
 
         Give ``filename`` with bytes, so that the instance knows the image type.
+        The instance accepts JPG, JPEG, PNG, GIF, WebP and BMP files of 10 MB
+        maximum. It refuses SVG. It sends :class:`ValidationError` for a file
+        that breaks a rule.
         """
         spec = RequestSpec("POST", "/v1/media", files=_upload_files(file, filename))
         return Media.from_dict(_object(unwrap_data(self._client._json(spec))))
@@ -630,7 +841,11 @@ class Guides:
         return self._get("/v1/guides/platforms")
 
     def platform(self, key: str) -> Any:
-        """Return the full guide of one platform, for example ``"instagram"``."""
+        """Return the full guide of one platform, for example ``"instagram"``.
+
+        A key that does not exist raises :class:`NotFoundError`. Its
+        ``available`` lists the valid keys.
+        """
         return self._get(f"/v1/guides/platforms/{_segment(key, 'key')}")
 
     def purposes(self) -> Any:
@@ -667,6 +882,8 @@ class AsyncSnapsbrew(BaseClient):
         self._owns_http = http_client is None
         self._http = http_client or httpx.AsyncClient(timeout=self._default_timeout)
         self.templates = AsyncTemplates(self)
+        self.documents = AsyncDocuments(self)
+        self.tags = AsyncTags(self)
         self.snaps = AsyncSnaps(self)
         self.batches = AsyncBatches(self)
         self.screenshots = AsyncScreenshots(self)
@@ -718,7 +935,7 @@ class AsyncSnapsbrew(BaseClient):
 
 
 class AsyncTemplates:
-    """Read templates and their layers."""
+    """Read, write and publish templates."""
 
     def __init__(self, client: AsyncSnapsbrew) -> None:
         self._client = client
@@ -749,6 +966,133 @@ class AsyncTemplates:
         """Return all canvas size presets."""
         body = await self._client._json(RequestSpec("GET", "/v1/templates/sizes", idempotent=True))
         return [TemplateSize.from_dict(item) for item in _objects(unwrap_data(body))]
+
+    async def create(
+        self,
+        title: str,
+        *,
+        size: str | None = None,
+        width: int | None = None,
+        height: int | None = None,
+        layers: Layers | None = None,
+        groups: Groups | None = None,
+    ) -> TemplateSummary:
+        """Create a template. See :meth:`Templates.create`."""
+        body = _template_body(
+            title=title,
+            size=size,
+            width=width,
+            height=height,
+            layers=layers,
+            groups=NOT_GIVEN if groups is None else groups,
+        )
+        return _summary(await self._client._json(RequestSpec("POST", "/v1/templates", json=body)))
+
+    async def update(
+        self,
+        template_id: str | int,
+        *,
+        title: str,
+        size: str | None = None,
+        width: int | None = None,
+        height: int | None = None,
+        layers: Layers | None = None,
+        groups: Groups | NotGiven | None = NOT_GIVEN,
+    ) -> TemplateSummary:
+        """Change a template. See :meth:`Templates.update`."""
+        body = _template_body(
+            title=title, size=size, width=width, height=height, layers=layers, groups=groups
+        )
+        spec = RequestSpec("PATCH", _template_path(template_id), json=body)
+        return _summary(await self._client._json(spec))
+
+    async def delete(self, template_id: str | int) -> None:
+        """Delete a template and its snaps, images, versions and forms. You cannot undo it."""
+        spec = RequestSpec("DELETE", _template_path(template_id), idempotent=True)
+        await self._client._send(spec)
+
+    async def publish(self, template_id: str) -> PublishedTemplate:
+        """Publish the draft as a new version. See :meth:`Templates.publish`."""
+        spec = RequestSpec("POST", _template_path(template_id, "/publish"), idempotent=True)
+        return PublishedTemplate.from_dict(_object(unwrap_data(await self._client._json(spec))))
+
+    async def preview(self, template_id: str, variants: Iterable[VariantLike] | None = None) -> str:
+        """Return a watermarked HTML preview of the published version."""
+        spec = RequestSpec(
+            "GET",
+            _template_path(template_id, "/preview"),
+            params=_variant_params(variants),
+            idempotent=True,
+        )
+        return (await self._client._send(spec)).text
+
+    async def set_tags(self, template_id: str, tag_ids: Iterable[int]) -> builtins.list[Tag]:
+        """Replace all tags of a template. An empty list removes each tag."""
+        spec = RequestSpec(
+            "POST",
+            _template_path(template_id, "/tags"),
+            json={"tag_ids": list(tag_ids)},
+            idempotent=True,
+        )
+        return _tags(_object(await self._client._json(spec)).get("tags"))
+
+
+class AsyncDocuments:
+    """Read and write the v2 editor document of a template. See :class:`Documents`."""
+
+    def __init__(self, client: AsyncSnapsbrew) -> None:
+        self._client = client
+
+    async def get(self, template_id: str) -> EditorDocument:
+        """Return the document and its revision. Read it before each write."""
+        spec = RequestSpec("GET", _template_path(template_id, "/document"), idempotent=True)
+        return EditorDocument.from_dict(_object(await self._client._json(spec)))
+
+    async def replace(
+        self, template_id: str, *, revision: int, document: Mapping[str, Any]
+    ) -> EditorDocument:
+        """Replace the whole document. See :meth:`Documents.replace`."""
+        spec = RequestSpec(
+            "PUT",
+            _template_path(template_id, "/document"),
+            json={"revision": revision, "document": dict(document)},
+        )
+        return EditorDocument.from_dict(_object(await self._client._json(spec)))
+
+    async def apply(
+        self, template_id: str, *, revision: int, operations: Operations
+    ) -> EditorDocument:
+        """Apply 1 to 100 operations. See :meth:`Documents.apply`."""
+        spec = RequestSpec(
+            "PATCH",
+            _template_path(template_id, "/document"),
+            json={"revision": revision, "operations": [dict(item) for item in operations]},
+        )
+        return EditorDocument.from_dict(_object(await self._client._json(spec)))
+
+    async def preflight(self, template_id: str) -> Preflight:
+        """Return the known problems of the stored document."""
+        path = _template_path(template_id, "/document/preflight")
+        body = await self._client._json(RequestSpec("GET", path, idempotent=True))
+        return Preflight.from_dict(_object(body))
+
+
+class AsyncTags:
+    """List and create the tags of your company."""
+
+    def __init__(self, client: AsyncSnapsbrew) -> None:
+        self._client = client
+
+    async def list(self, *, search: str | None = None) -> builtins.list[Tag]:
+        """Return up to 15 tags, sorted by name."""
+        params = [("search", search)] if search else None
+        spec = RequestSpec("GET", "/v1/tags", params=params, idempotent=True)
+        return _tags(unwrap_data(await self._client._json(spec)))
+
+    async def create(self, name: str) -> Tag:
+        """Create a tag. The instance makes the slug from the name."""
+        body = await self._client._json(RequestSpec("POST", "/v1/tags", json={"name": name}))
+        return Tag.from_dict(_object(unwrap_data(body)))
 
 
 class AsyncSnaps:
@@ -810,7 +1154,7 @@ class AsyncSnaps:
         return _snaps_from_response(response)
 
     async def preview(self, template_id: str, variants: Iterable[VariantLike] | None = None) -> str:
-        """Return a watermarked HTML preview. A preview costs no credit."""
+        """Return a watermarked HTML preview. A preview stores nothing."""
         spec = RequestSpec(
             "GET",
             "/v1/snaps/preview",
@@ -919,7 +1263,11 @@ class AsyncScreenshots:
     async def create(
         self, url: str, *, width: int | None = None, height: int | None = None
     ) -> Screenshot:
-        """Capture a page. The default viewport is 1330 x 780 pixels."""
+        """Capture a page. The default viewport is 1330 x 780 pixels.
+
+        The instance accepts a ``width`` and a ``height`` of 1 to 4000 pixels.
+        It sends :class:`ValidationError` for another value.
+        """
         spec = RequestSpec("POST", "/v1/screenshots", json=_screenshot_body(url, width, height))
         return Screenshot.from_dict(_object(unwrap_data(await self._client._json(spec))))
 

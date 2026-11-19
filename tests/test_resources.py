@@ -11,7 +11,19 @@ import httpx
 import pytest
 import respx
 
-from snapsbrew import Hidden, Image, Media, Snapsbrew, Text, WaitTimeoutError
+from snapsbrew import (
+    RENDER_FAILED,
+    WEBHOOK_HTTP_PREFIX,
+    WEBHOOK_REDIRECT_REFUSED,
+    WEBHOOK_UNREACHABLE,
+    Hidden,
+    Image,
+    Media,
+    Snapsbrew,
+    Text,
+    ValidationError,
+    WaitTimeoutError,
+)
 from tests.conftest import (
     BATCH_BODY,
     MEDIA_BODY,
@@ -299,7 +311,7 @@ def test_batches_get(client: Snapsbrew, api: respx.MockRouter) -> None:
                     "identifier": "row-2",
                     "status": "failed",
                     "media_url": None,
-                    "last_error": "Render failed.",
+                    "last_error": "render_failed",
                 },
             ],
         }
@@ -307,7 +319,7 @@ def test_batches_get(client: Snapsbrew, api: respx.MockRouter) -> None:
     batch = client.batches.get(BATCH_BODY["uuid"])
     assert batch.is_finished
     assert [item.status for item in batch.items] == ["completed", "failed"]
-    assert batch.items[1].last_error == "Render failed."
+    assert batch.items[1].last_error == RENDER_FAILED
 
 
 def test_batches_cancel(client: Snapsbrew, api: respx.MockRouter) -> None:
@@ -476,3 +488,52 @@ def test_guides(
 ) -> None:
     api.get(path).respond(json={"data": {"key": method}})
     assert getattr(client.guides, method)(*args) == {"key": method}
+
+
+@pytest.mark.parametrize(
+    "code",
+    ["render_failed", "webhook_redirect_refused", "webhook_unreachable", "webhook_http_500"],
+)
+def test_snap_last_error_is_a_code(code: str, client: Snapsbrew, api: respx.MockRouter) -> None:
+    api.post("/v1/snaps").respond(201, json={**SNAP_BODY, "last_error": code})
+    assert client.snaps.create(TEMPLATE_ID).last_error == code
+
+
+def test_the_last_error_constants_match_the_app() -> None:
+    assert (RENDER_FAILED, WEBHOOK_REDIRECT_REFUSED, WEBHOOK_UNREACHABLE) == (
+        "render_failed",
+        "webhook_redirect_refused",
+        "webhook_unreachable",
+    )
+    assert f"{WEBHOOK_HTTP_PREFIX}503" == "webhook_http_503"
+
+
+def test_snap_create_reads_a_body_with_no_data_wrapper(
+    client: Snapsbrew, api: respx.MockRouter
+) -> None:
+    api.post("/v1/snaps").respond(201, json=SNAP_BODY)
+    assert client.snaps.create(TEMPLATE_ID).id == SNAP_BODY["id"]
+
+
+def test_screenshots_create_sends_width_and_height_without_checks(
+    client: Snapsbrew, api: respx.MockRouter
+) -> None:
+    # The instance accepts 1 to 4000. The SDK sends any value and lets the instance decide.
+    route = api.post("/v1/screenshots").respond(
+        422, json={"message": "Too wide.", "errors": {"width": ["Too wide."]}}
+    )
+    with pytest.raises(ValidationError) as caught:
+        client.screenshots.create("https://example.com", width=5000, height=1)
+    assert sent_json(route) == {"url": "https://example.com", "width": 5000, "height": 1}
+    assert caught.value.errors["width"] == ["Too wide."]
+
+
+def test_media_upload_of_an_svg_is_a_validation_error(
+    client: Snapsbrew, api: respx.MockRouter
+) -> None:
+    api.post("/v1/media").respond(
+        422, json={"message": "Wrong type.", "errors": {"file": ["Wrong type."]}}
+    )
+    with pytest.raises(ValidationError) as caught:
+        client.media.upload(b"<svg/>", filename="logo.svg")
+    assert "file" in caught.value.errors

@@ -9,25 +9,28 @@ All errors come from :class:`SnapsbrewError`::
     |   +-- BadRequestError        400
     |   +-- AuthenticationError    401
     |   +-- AuthorizationError     403
-    |   +-- NotFoundError          404
-    |   +-- ConflictError          409, with the conflict code
-    |   +-- ValidationError        422, with the field errors
+    |   +-- NotFoundError          404, with the valid guide keys
+    |   +-- ConflictError          409, with the conflict code and the stored document
+    |   +-- ValidationError        422, with the field errors or a code
     |   +-- RateLimitError         429, with the Retry-After value and the limit
     |   +-- ServerError            5xx
     +-- WaitTimeoutError           a batch did not finish in the wait time
+    +-- WebhookVerificationError   a webhook did not pass the verification
 """
 
 from __future__ import annotations
 
-from typing import Any, Final
+from typing import Any, Final, Literal
 
 import httpx
 
 __all__ = [
+    "EDITOR_DOCUMENT_CONFLICT",
     "IDEMPOTENCY_KEY_BELONGS_TO_BATCH",
     "IDEMPOTENCY_KEY_BELONGS_TO_SNAP",
     "IDEMPOTENCY_KEY_IN_PROGRESS",
     "INTERNAL_ERROR",
+    "LEGACY_EDIT_REJECTED_FOR_V2",
     "APIConnectionError",
     "APIError",
     "APITimeoutError",
@@ -41,6 +44,7 @@ __all__ = [
     "SnapsbrewError",
     "ValidationError",
     "WaitTimeoutError",
+    "WebhookVerificationError",
 ]
 
 # The `code` values of a 409 for an idempotency key.
@@ -53,6 +57,18 @@ IDEMPOTENCY_KEY_BELONGS_TO_SNAP: Final = "idempotency_key_belongs_to_snap"
 
 IDEMPOTENCY_KEY_BELONGS_TO_BATCH: Final = "idempotency_key_belongs_to_batch"
 """A single snap request sent a key that belongs to a batch. Send a new key."""
+
+EDITOR_DOCUMENT_CONFLICT: Final = "editor_document_conflict"
+"""The stored revision of an editor document moved. The instance saved nothing.
+
+Read ``current_revision`` and ``current_document`` on the :class:`ConflictError`.
+"""
+
+LEGACY_EDIT_REJECTED_FOR_V2: Final = "legacy_edit_rejected_for_v2"
+"""``templates.update()`` cannot change a template that uses the v2 editor document.
+
+Use ``documents.apply()`` or ``documents.replace()`` for this template.
+"""
 
 INTERNAL_ERROR: Final = "internal_error"
 """The `code` of a 500 from ``POST /v1/snaps`` and ``POST /v1/snaps/batches``.
@@ -124,8 +140,9 @@ class AuthenticationError(APIError):
 class AuthorizationError(APIError):
     """The token is valid but it cannot do this action (403).
 
-    A token must have the ``api_requests`` ability. A permission check of the
-    instance can also refuse the request, for example on ``POST /v1/snaps``.
+    Each operation sends 403 with the message ``"Invalid ability provided."``
+    when the token does not have the ``api_requests`` ability. A permission
+    check of the instance can also refuse the request, for example a delete.
     """
 
 
@@ -134,7 +151,20 @@ class NotFoundError(APIError):
 
     ``POST /v1/snaps`` and ``POST /v1/snaps/batches`` do not send 404 for a
     ``template_id`` that does not exist. They send :class:`ValidationError`.
+
+    Do not read the message to find the cause. Its text can change.
+
+    Attributes:
+        available: The valid keys, when ``guides.platform()`` or
+            ``guides.purpose()`` gets a key that does not exist. Else empty.
     """
+
+    def __init__(self, message: str, *, response: httpx.Response, body: Any = None) -> None:
+        super().__init__(message, response=response, body=body)
+        available = body.get("available") if isinstance(body, dict) else None
+        self.available: list[str] = (
+            [str(key) for key in available] if isinstance(available, list) else []
+        )
 
 
 class ConflictError(APIError):
@@ -148,11 +178,32 @@ class ConflictError(APIError):
     - :data:`IDEMPOTENCY_KEY_BELONGS_TO_SNAP` and
       :data:`IDEMPOTENCY_KEY_BELONGS_TO_BATCH`: the key belongs to a different
       kind of request. A repeat never succeeds. Send a new key.
-    - ``"legacy_edit_rejected_for_v2"``: a v1 edit of a template that uses the v2
-      editor document.
+    - :data:`EDITOR_DOCUMENT_CONFLICT`: another write changed the editor
+      document after your last read. Apply your change to ``current_document``
+      and send it again with ``current_revision``.
+    - :data:`LEGACY_EDIT_REJECTED_FOR_V2`: ``templates.update()`` on a template
+      that uses the v2 editor document.
 
-    The instance created nothing in each case.
+    The instance saved nothing in each case.
+
+    Attributes:
+        current_revision: The stored revision, for an editor document conflict.
+            Else ``None``.
+        current_document: The stored document, for an editor document conflict.
+            ``None`` when the template has no draft, or for another conflict.
     """
+
+    def __init__(self, message: str, *, response: httpx.Response, body: Any = None) -> None:
+        super().__init__(message, response=response, body=body)
+        fields = body if isinstance(body, dict) else {}
+        revision = fields.get("current_revision")
+        document = fields.get("current_document")
+        self.current_revision: int | None = (
+            revision if isinstance(revision, int) and not isinstance(revision, bool) else None
+        )
+        self.current_document: dict[str, Any] | None = (
+            document if isinstance(document, dict) else None
+        )
 
     @property
     def retryable(self) -> bool:
@@ -162,6 +213,10 @@ class ConflictError(APIError):
 
 class ValidationError(APIError):
     """A field of the request failed a validation rule (422).
+
+    ``documents.apply()`` sends a 422 with a ``code`` and no field errors when
+    the document refuses an operation, for example
+    ``"editor_operation_layer_not_found"``. Then ``errors`` is empty.
 
     Attributes:
         errors: The field errors, for example ``{"template_id": ["..."]}``.
@@ -202,6 +257,25 @@ class ServerError(APIError):
     ``POST /v1/snaps`` and ``POST /v1/snaps/batches`` send the code
     :data:`INTERNAL_ERROR` and a fixed message. Give ``request_id`` to support.
     """
+
+
+WebhookFailure = Literal["signature", "timestamp", "delivery"]
+
+
+class WebhookVerificationError(SnapsbrewError):
+    """A webhook did not pass the verification. Do not use its body.
+
+    Attributes:
+        reason: ``"signature"`` when the signature is missing or does not match.
+            ``"timestamp"`` when the timestamp is missing, is not Unix seconds,
+            or is outside the tolerance. ``"delivery"`` when the delivery ID
+            is missing.
+    """
+
+    def __init__(self, message: str, *, reason: WebhookFailure) -> None:
+        super().__init__(message)
+        self.message = message
+        self.reason: WebhookFailure = reason
 
 
 def _field_errors(body: Any) -> dict[str, list[str]]:

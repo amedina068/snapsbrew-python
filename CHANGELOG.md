@@ -4,6 +4,43 @@ All notable changes to this package are in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The package uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - Unreleased
+
+This version adopts the OpenAPI spec of Snapsbrew PR #93 and the webhook signatures of Snapsbrew PR #95.
+
+### Added
+
+- Template writes: `templates.create()`, `templates.update()`, `templates.delete()`, `templates.publish()`, `templates.preview()` and `templates.set_tags()`.
+- The `groups` field of `templates.create()` and `templates.update()`. In `update()`, `groups=None` removes each group.
+- The editor document resource `client.documents`: `get()`, `replace()`, `apply()` and `preflight()`.
+- The tag resource `client.tags`: `list()` and `create()`.
+- The models `TemplateSummary`, `PublishedTemplate`, `EditorDocument`, `Preflight`, `PreflightIssue` and `Tag`.
+- The request shapes `LayerDefinition`, `LayerProperty`, `LayerGroup`, `SetLayerProperty`, `SetLayerType` and `EditorOperation`, as `TypedDict` classes.
+- `ConflictError.current_revision` and `ConflictError.current_document`, for an editor document conflict.
+- The conflict code constants `EDITOR_DOCUMENT_CONFLICT` and `LEGACY_EDIT_REJECTED_FOR_V2`.
+- `NotFoundError.available`: the valid keys when `guides.platform()` or `guides.purpose()` gets a key that does not exist.
+- The `last_error` code constants `RENDER_FAILED`, `WEBHOOK_REDIRECT_REFUSED`, `WEBHOOK_UNREACHABLE` and `WEBHOOK_HTTP_PREFIX`.
+- The webhook verifier `verify_webhook()`. It checks `X-Snapsbrew-Signature` in constant time and refuses a timestamp more than `tolerance` seconds (300 by default) from the current time. It returns a `WebhookEvent` with `type`, `delivery_id`, `timestamp`, `data`, `snap` and `batch`.
+- `WebhookVerificationError`, with the `reason` `"signature"`, `"timestamp"` or `"delivery"`.
+- The webhook event constants `SNAP_COMPLETED`, `SNAP_FAILED`, `SNAP_IMPORT_COMPLETED`, `SNAP_IMPORT_FAILED` and `SNAP_IMPORT_CANCELED`.
+- `snapsbrew.webhooks.sign()`, to make a signed webhook in a test.
+- The webhook vectors of the app in the test suite.
+- README sections for template writes, editor documents, tags and webhooks, and webhook receivers for Django and FastAPI.
+
+### Changed
+
+- `Snap.media_url` is `None` when the instance sends an empty string. The webhook of a failed snap sends an empty string.
+- `ValidationError` documents a 422 with a `code` and no field errors. `documents.apply()` sends it when the document refuses an operation.
+- `AuthorizationError` documents that each operation can send 403 with the message `Invalid ability provided.`
+- `NotFoundError` documents that the text of a 404 message can change.
+- The docstrings and the README document the request rules of `media.upload()` and `screenshots.create()`. The client does not check them.
+- The README says that a signed URL accepts any active key of the company of the template, and that the builder refuses the reserved parameters `identifier` and `api_log_uuid`.
+- The README links to the SDK overview at <https://snapsbrew.com/docs/sdks/overview>.
+
+### Removed
+
+- The text that says that a render costs a credit. The instance keeps a usage log with no balance.
+
 ## [0.1.0] - Unreleased
 
 ### Added

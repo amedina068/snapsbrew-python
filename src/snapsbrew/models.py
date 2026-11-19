@@ -9,25 +9,51 @@ from __future__ import annotations
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Generic, TypeVar
+from typing import Any, Final, Generic, TypeVar
 
 __all__ = [
+    "RENDER_FAILED",
+    "WEBHOOK_HTTP_PREFIX",
+    "WEBHOOK_REDIRECT_REFUSED",
+    "WEBHOOK_UNREACHABLE",
     "Account",
     "Batch",
     "BatchItem",
+    "EditorDocument",
     "Layer",
     "Media",
     "MediaPage",
     "Page",
+    "Preflight",
+    "PreflightIssue",
+    "PublishedTemplate",
     "Screenshot",
     "Snap",
+    "Tag",
     "Template",
     "TemplateSize",
+    "TemplateSummary",
 ]
 
 T = TypeVar("T")
 
 BATCH_TERMINAL_STATUSES = frozenset({"completed", "failed", "canceled"})
+
+# The codes of `Snap.last_error` and `BatchItem.last_error`. The instance never
+# puts the text of an exception or of a webhook response in this field.
+
+RENDER_FAILED: Final = "render_failed"
+"""The render failed. The status of the snap is ``failed``."""
+
+WEBHOOK_REDIRECT_REFUSED: Final = "webhook_redirect_refused"
+"""The webhook receiver sent a redirect. The instance does not follow a redirect."""
+
+WEBHOOK_UNREACHABLE: Final = "webhook_unreachable"
+"""The instance did not get a response from the webhook receiver."""
+
+WEBHOOK_HTTP_PREFIX: Final = "webhook_http_"
+"""The start of the code for an error status of the webhook receiver, for example
+``webhook_http_500``."""
 
 
 @dataclass(frozen=True)
@@ -146,7 +172,14 @@ class TemplateSize:
 class Snap:
     """A render of a template.
 
-    ``media_url`` is ``None`` until the status is ``completed``.
+    ``media_url`` is ``None`` until the status is ``completed``. The webhook of
+    a failed snap sends an empty string, and the SDK also gives ``None``.
+
+    ``last_error`` is ``None``, or a fixed code: :data:`RENDER_FAILED`,
+    :data:`WEBHOOK_REDIRECT_REFUSED`, :data:`WEBHOOK_UNREACHABLE`, or
+    :data:`WEBHOOK_HTTP_PREFIX` and the status of the receiver, for example
+    ``"webhook_http_500"``. A webhook code means that the snap rendered, but the
+    instance did not deliver the webhook.
     ``replayed`` is ``True`` when the server returned an earlier snap for the same
     ``idempotency_key`` and rendered nothing.
     ``variants`` is empty when the request sent no variants. ``template_id``,
@@ -188,7 +221,7 @@ class Snap:
             id=_str(data.get("id")),
             status=_str(data.get("status")),
             type=_str(data.get("type")) or "image",
-            media_url=_opt_str(data.get("media_url")),
+            media_url=_opt_str(data.get("media_url")) or None,
             is_async=bool(data.get("is_async")),
             webhook_url=_opt_str(data.get("webhook_url")),
             completed_at=_datetime(data.get("completed_at")),
@@ -207,7 +240,10 @@ class Snap:
 
 @dataclass(frozen=True)
 class BatchItem:
-    """One snap of a batch."""
+    """One snap of a batch.
+
+    ``last_error`` is ``None``, or :data:`RENDER_FAILED` when the item failed.
+    """
 
     id: str
     identifier: str | None
@@ -351,6 +387,141 @@ class Media:
             original_url=_opt_str(data.get("original_url")),
             created_at=_datetime(data.get("created_at")),
             raw=data,
+        )
+
+
+@dataclass(frozen=True)
+class TemplateSummary:
+    """The template fields that ``templates.create()`` and ``templates.update()`` return.
+
+    ``size`` is the canvas preset, ``"custom"``, or ``None`` for an old template
+    with no preset. A write that sends ``size`` sets the width and the height,
+    and a write that sends the width and the height sets ``size``.
+    """
+
+    uuid: str
+    title: str
+    size: str | None
+    width: int
+    height: int
+    created_at: datetime | None
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
+
+    @property
+    def id(self) -> str:
+        """The same value as ``uuid``. Use it as ``template_id``."""
+        return self.uuid
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> TemplateSummary:
+        return cls(
+            uuid=_str(data.get("uuid")),
+            title=_str(data.get("title")),
+            size=_opt_str(data.get("size")),
+            width=_int(data.get("width")),
+            height=_int(data.get("height")),
+            created_at=_datetime(data.get("created_at")),
+            raw=data,
+        )
+
+
+@dataclass(frozen=True)
+class PublishedTemplate:
+    """The result of ``templates.publish()``: the version that snaps now render."""
+
+    uuid: str
+    published_version: int
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> PublishedTemplate:
+        # The body also has `id`, a deprecated copy of `uuid`.
+        return cls(
+            uuid=_str(data.get("uuid") or data.get("id")),
+            published_version=_int(data.get("published_version")),
+            raw=data,
+        )
+
+
+@dataclass(frozen=True)
+class Tag:
+    """A tag of your company. The instance makes the slug from the name."""
+
+    id: int
+    name: str
+    slug: str
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> Tag:
+        return cls(
+            id=_int(data.get("id")),
+            name=_str(data.get("name")),
+            slug=_str(data.get("slug")),
+            raw=data,
+        )
+
+
+@dataclass(frozen=True)
+class EditorDocument:
+    """The v2 editor document of a template, and its revision.
+
+    ``document`` is ``None`` and ``revision`` is 0 when the template has no
+    draft. Send ``revision`` with the next write.
+    """
+
+    document: dict[str, Any] | None
+    revision: int
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> EditorDocument:
+        document = data.get("document")
+        return cls(
+            document=document if isinstance(document, dict) else None,
+            revision=_int(data.get("revision")),
+        )
+
+
+@dataclass(frozen=True)
+class PreflightIssue:
+    """One known problem of an editor document.
+
+    ``path`` is a JSON pointer into the document, for example ``"/layers/0/source"``.
+    """
+
+    code: str
+    path: str
+    message: str
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> PreflightIssue:
+        return cls(
+            code=_str(data.get("code")),
+            path=_str(data.get("path")),
+            message=_str(data.get("message")),
+        )
+
+
+@dataclass(frozen=True)
+class Preflight:
+    """The result of ``documents.preflight()``.
+
+    An empty ``issues`` means that the known checks pass. The checks do not
+    prove that the render looks correct.
+    """
+
+    issues: tuple[PreflightIssue, ...]
+    revision: int
+
+    @property
+    def ok(self) -> bool:
+        return not self.issues
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> Preflight:
+        return cls(
+            issues=tuple(PreflightIssue.from_dict(item) for item in _dicts(data.get("issues"))),
+            revision=_int(data.get("revision")),
         )
 
 

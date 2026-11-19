@@ -1,7 +1,7 @@
 """Integration tests against a live instance.
 
 The tests run only when SNAPSBREW_TEST_URL and SNAPSBREW_TEST_TOKEN are set.
-They are read-only, except for one preview call. A preview costs no credit.
+They are read-only, except for one preview call. A preview stores nothing.
 """
 
 from __future__ import annotations

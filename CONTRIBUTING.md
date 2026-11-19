@@ -39,7 +39,7 @@ SNAPSBREW_TEST_TOKEN=... \
 uv run pytest -m integration
 ```
 
-The integration tests are read-only, except for one preview call. A preview costs no credit.
+The integration tests are read-only, except for one preview call. A preview stores nothing.
 
 > **CAUTION:** Do not put a token in a file of the repository. Do not paste a token in an issue or a pull request.
 

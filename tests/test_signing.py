@@ -143,6 +143,7 @@ def test_canonical_string_ignores_signature() -> None:
         ({"format": "jpeg", "transparent": True}, "transparent"),
         ({"params": {"signature": "x"}}, "signature"),
         ({"params": {"identifier": "x"}}, "identifier"),
+        ({"params": {"api_log_uuid": "x"}}, "api_log_uuid"),
         ({"params": {"format": "png"}}, "format"),
         ({"params": {"a.b": "x"}}, "a.b"),
         ({"params": {"10": "x"}}, "10"),
