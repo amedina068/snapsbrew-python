@@ -49,8 +49,30 @@ def test_missing_settings_raise(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("SNAPSBREW_TOKEN", raising=False)
     with pytest.raises(ValueError, match="SNAPSBREW_URL"):
         Snapsbrew(token=TOKEN)
-    with pytest.raises(ValueError, match="SNAPSBREW_TOKEN"):
-        Snapsbrew(base_url="https://snapsbrew.test")
+
+
+@pytest.mark.parametrize("token", [None, "", "  "])
+def test_a_call_with_no_token_fails_before_the_send(
+    monkeypatch: pytest.MonkeyPatch, token: str | None
+) -> None:
+    monkeypatch.delenv("SNAPSBREW_TOKEN", raising=False)
+    with (
+        respx.mock(assert_all_called=False) as router,
+        Snapsbrew(base_url="https://snapsbrew.test", token=token) as client,
+    ):
+        route = router.get("https://snapsbrew.test/api/v1/auth").respond(200, json={"data": {}})
+        with pytest.raises(ValueError, match="no API token"):
+            client.account()
+        assert route.call_count == 0
+
+
+async def test_an_async_call_with_no_token_fails_before_the_send(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("SNAPSBREW_TOKEN", raising=False)
+    async with AsyncSnapsbrew(base_url="https://snapsbrew.test") as client:
+        with pytest.raises(ValueError, match="no API token"):
+            await client.account()
 
 
 def test_negative_max_retries_raises() -> None:
@@ -64,9 +86,9 @@ def test_repr_does_not_show_the_token() -> None:
         assert repr(client) == "Snapsbrew(base_url='https://snapsbrew.test')"
 
 
-def test_default_timeout_is_30_seconds() -> None:
+def test_default_timeout_is_60_seconds() -> None:
     with Snapsbrew(base_url="https://snapsbrew.test", token=TOKEN) as client:
-        assert client._http.timeout == httpx.Timeout(30.0)
+        assert client._http.timeout == httpx.Timeout(60.0)
 
 
 def test_custom_timeout_goes_on_each_request() -> None:
@@ -75,7 +97,7 @@ def test_custom_timeout_goes_on_each_request() -> None:
         Snapsbrew(base_url="https://snapsbrew.test", token=TOKEN, timeout=5.0) as client,
     ):
         route = api.get("/v1/auth").respond(json=AUTH_BODY)
-        client.whoami()
+        client.account()
         assert route.calls.last.request.extensions["timeout"]["read"] == 5.0
 
 
@@ -86,7 +108,7 @@ def test_custom_http_client_is_used_and_not_closed() -> None:
         Snapsbrew(base_url="https://snapsbrew.test", token=TOKEN, http_client=http) as client,
     ):
         route = api.get("/v1/auth").respond(json=AUTH_BODY)
-        client.whoami()
+        client.account()
         request = route.calls.last.request
         assert request.headers["x-custom"] == "yes"
         # The client keeps the timeout of your http_client.

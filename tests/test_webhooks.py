@@ -46,8 +46,8 @@ def signed_headers(body: str, timestamp: str) -> dict[str, str]:
 
 
 def test_the_vectors_have_valid_and_invalid_cases() -> None:
-    assert len(VALID) == 3
-    assert len(INVALID) == 4
+    assert len(VALID) == 7
+    assert len(INVALID) == 11
     assert VECTORS["tolerance_seconds"] == DEFAULT_TOLERANCE
 
 
@@ -55,9 +55,9 @@ def test_the_vectors_have_valid_and_invalid_cases() -> None:
 def test_valid_vector_is_accepted(case: dict[str, Any]) -> None:
     event = verify_webhook(case["body"].encode("utf-8"), case["headers"], SECRET, now=NOW)
     assert isinstance(event, WebhookEvent)
-    assert event.type == case["name"]
+    assert event.type == json.loads(case["body"])["event"]
     assert event.data == json.loads(case["body"])
-    assert event.delivery_id == case["headers"]["X-Snapsbrew-Delivery"]
+    assert event.delivery_id == case["delivery_id"]
     assert event.timestamp == int(case["headers"]["X-Snapsbrew-Timestamp"])
 
 
@@ -65,10 +65,10 @@ def test_valid_vector_is_accepted(case: dict[str, Any]) -> None:
 def test_invalid_vector_is_refused(case: dict[str, Any]) -> None:
     with pytest.raises(WebhookVerificationError) as caught:
         verify_webhook(case["body"], case["headers"], SECRET, now=NOW)
-    assert caught.value.reason == "signature"
+    assert caught.value.reason == case["reason"]
 
 
-@pytest.mark.parametrize("case", VALID, ids=[case["name"] for case in VALID])
+@pytest.mark.parametrize("case", VALID[:3], ids=[case["name"] for case in VALID[:3]])
 def test_sign_matches_the_app(case: dict[str, Any]) -> None:
     timestamp = case["headers"]["X-Snapsbrew-Timestamp"]
     assert case["signed_string"] == f"{timestamp}.{case['body']}"
@@ -95,16 +95,15 @@ def test_snap_completed_gives_the_snap() -> None:
     assert event.batch is None
 
 
-def test_snap_failed_gives_a_failed_snap_with_no_media_url() -> None:
+def test_snap_failed_gives_a_failed_snap_with_an_empty_media_url() -> None:
     case = case_named("snap.failed")
     event = verify_webhook(case["body"], case["headers"], SECRET, now=NOW)
     assert event.type == SNAP_FAILED
     assert event.snap is not None
     assert event.snap.status == "failed"
     assert event.snap.last_error == RENDER_FAILED
-    # The app sends an empty string. The SDK gives None, as for a snap that did not render.
-    assert event.snap.media_url is None
-    assert event.snap.raw["media_url"] == ""
+    # The app sends an empty string. The SDK gives it as it is, as the other SDKs do.
+    assert event.snap.media_url == ""
 
 
 def test_snap_import_gives_the_batch_counts_and_the_template() -> None:
@@ -152,7 +151,6 @@ def test_headers_with_a_get_method_work() -> None:
     [
         ("X-Snapsbrew-Signature", "signature"),
         ("X-Snapsbrew-Timestamp", "timestamp"),
-        ("X-Snapsbrew-Delivery", "delivery"),
     ],
 )
 def test_a_missing_header_is_refused(missing: str, reason: str) -> None:
@@ -227,3 +225,22 @@ def test_bad_arguments_raise_value_error(secret: str, tolerance: int, message: s
     case = VALID[0]
     with pytest.raises(ValueError, match=message):
         verify_webhook(case["body"], case["headers"], secret, tolerance=tolerance, now=NOW)
+
+
+def test_a_missing_delivery_header_gives_none() -> None:
+    case = VALID[0]
+    headers = {k: v for k, v in case["headers"].items() if k != "X-Snapsbrew-Delivery"}
+    assert verify_webhook(case["body"], headers, SECRET, now=NOW).delivery_id is None
+
+
+def test_a_header_list_gives_its_first_value() -> None:
+    case = VALID[0]
+    headers: Any = {name: [value] for name, value in case["headers"].items()}
+    assert verify_webhook(case["body"], headers, SECRET, now=NOW).delivery_id == DELIVERY_ID
+
+
+@pytest.mark.parametrize("body", ["{", "[]", '"text"', "\xff"])
+def test_a_body_that_is_not_a_json_object_fails_on_the_payload(body: str) -> None:
+    with pytest.raises(WebhookVerificationError) as caught:
+        verify_webhook(body, signed_headers(body, str(NOW)), SECRET, now=NOW)
+    assert caught.value.reason == "payload"

@@ -40,7 +40,7 @@ def test_get_retries_a_5xx_then_succeeds(
     route = api.get("/v1/auth").mock(
         side_effect=[httpx.Response(503), httpx.Response(500), ok_auth()]
     )
-    assert client.whoami().name == "Ada"
+    assert client.account().name == "Ada"
     assert route.call_count == 3
     assert len(sleeps.delays) == 2
 
@@ -50,7 +50,7 @@ def test_retries_stop_at_max_retries(
 ) -> None:
     route = api.get("/v1/auth").respond(500)
     with pytest.raises(ServerError):
-        client.whoami()
+        client.account()
     assert route.call_count == 3
     assert len(sleeps.delays) == 2
 
@@ -61,7 +61,7 @@ def test_max_retries_zero_sends_once(api: respx.MockRouter) -> None:
         Snapsbrew(base_url="https://snapsbrew.test", token="t", max_retries=0) as client,
         pytest.raises(ServerError),
     ):
-        client.whoami()
+        client.account()
     assert route.call_count == 1
 
 
@@ -91,6 +91,40 @@ def test_batch_cancel_is_retried_on_5xx(client: Snapsbrew, api: respx.MockRouter
     assert route.call_count == 2
 
 
+def test_template_delete_is_retried_on_5xx(client: Snapsbrew, api: respx.MockRouter) -> None:
+    route = api.delete(f"/v1/templates/{TEMPLATE_ID}").mock(
+        side_effect=[httpx.Response(503), httpx.Response(200, json={"message": "Deleted"})]
+    )
+    client.templates.delete(TEMPLATE_ID)
+    assert route.call_count == 2
+
+
+def test_set_tags_is_retried_on_5xx(client: Snapsbrew, api: respx.MockRouter) -> None:
+    route = api.post(f"/v1/templates/{TEMPLATE_ID}/tags").mock(
+        side_effect=[httpx.Response(502), httpx.Response(200, json={"tags": []})]
+    )
+    assert client.templates.set_tags(TEMPLATE_ID, []) == []
+    assert route.call_count == 2
+
+
+def test_template_update_is_not_retried_on_5xx(client: Snapsbrew, api: respx.MockRouter) -> None:
+    route = api.patch(f"/v1/templates/{TEMPLATE_ID}").respond(500)
+    with pytest.raises(ServerError):
+        client.templates.update(TEMPLATE_ID, title="Card")
+    assert route.call_count == 1
+
+
+def test_document_replace_is_not_retried_on_read_timeout(
+    client: Snapsbrew, api: respx.MockRouter
+) -> None:
+    route = api.put(f"/v1/templates/{TEMPLATE_ID}/document").mock(
+        side_effect=httpx.ReadTimeout("slow")
+    )
+    with pytest.raises(APITimeoutError):
+        client.documents.replace(TEMPLATE_ID, revision=1, document={"layers": []})
+    assert route.call_count == 1
+
+
 def test_post_is_retried_on_429_with_retry_after(
     client: Snapsbrew, api: respx.MockRouter, sleeps: SleepRecorder
 ) -> None:
@@ -110,7 +144,7 @@ def test_429_with_a_long_retry_after_is_not_retried(
 ) -> None:
     route = api.get("/v1/auth").respond(429, headers={"Retry-After": "3600"})
     with pytest.raises(RateLimitError) as caught:
-        client.whoami()
+        client.account()
     assert route.call_count == 1
     assert caught.value.retry_after == 3600.0
     assert sleeps.delays == []
@@ -120,7 +154,7 @@ def test_429_without_retry_after_uses_backoff(
     client: Snapsbrew, api: respx.MockRouter, sleeps: SleepRecorder
 ) -> None:
     api.get("/v1/auth").mock(side_effect=[httpx.Response(429), ok_auth()])
-    client.whoami()
+    client.account()
     assert len(sleeps.delays) == 1
     assert 0.25 <= sleeps.delays[0] <= 0.5
 
@@ -142,7 +176,7 @@ def test_post_is_not_retried_on_read_timeout(client: Snapsbrew, api: respx.MockR
 
 def test_get_is_retried_on_read_timeout(client: Snapsbrew, api: respx.MockRouter) -> None:
     route = api.get("/v1/auth").mock(side_effect=[httpx.ReadTimeout("slow"), ok_auth()])
-    client.whoami()
+    client.account()
     assert route.call_count == 2
 
 
@@ -273,7 +307,7 @@ async def test_async_key_of_the_other_kind_is_not_retried(
 def test_validation_errors_are_never_retried(client: Snapsbrew, api: respx.MockRouter) -> None:
     route = api.get("/v1/auth").respond(422, json={"message": "Bad."})
     with pytest.raises(ValidationError):
-        client.whoami()
+        client.account()
     assert route.call_count == 1
 
 
@@ -283,7 +317,7 @@ async def test_async_client_retries(
     route = api.get("/v1/auth").mock(
         side_effect=[httpx.ConnectError("refused"), httpx.Response(503), ok_auth()]
     )
-    assert (await aclient.whoami()).name == "Ada"
+    assert (await aclient.account()).name == "Ada"
     assert route.call_count == 3
     assert len(sleeps.delays) == 2
 

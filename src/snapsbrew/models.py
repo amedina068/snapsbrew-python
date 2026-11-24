@@ -172,8 +172,9 @@ class TemplateSize:
 class Snap:
     """A render of a template.
 
-    ``media_url`` is ``None`` until the status is ``completed``. The webhook of
-    a failed snap sends an empty string, and the SDK also gives ``None``.
+    ``media_url`` is the value that the instance sends. The instance sends an
+    empty string for a snap with no image, for example a failed snap. The other
+    SDKs give the same value.
 
     ``last_error`` is ``None``, or a fixed code: :data:`RENDER_FAILED`,
     :data:`WEBHOOK_REDIRECT_REFUSED`, :data:`WEBHOOK_UNREACHABLE`, or
@@ -221,7 +222,7 @@ class Snap:
             id=_str(data.get("id")),
             status=_str(data.get("status")),
             type=_str(data.get("type")) or "image",
-            media_url=_opt_str(data.get("media_url")) or None,
+            media_url=_opt_str(data.get("media_url")),
             is_async=bool(data.get("is_async")),
             webhook_url=_opt_str(data.get("webhook_url")),
             completed_at=_datetime(data.get("completed_at")),

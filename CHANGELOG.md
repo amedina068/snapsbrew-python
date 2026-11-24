@@ -26,8 +26,20 @@ This version adopts the OpenAPI spec of Snapsbrew PR #93 and the webhook signatu
 - `snapsbrew.webhooks.sign()`, to make a signed webhook in a test.
 - The webhook vectors of the app in the test suite.
 - README sections for template writes, editor documents, tags and webhooks, and webhook receivers for Django and FastAPI.
+- `client.forms.submit(url, layers)` sends the layers of an embedded form to its signed submit URL, as in the Ruby SDK. It sends no token. A template form returns one `Snap`. A collection form returns a list of snaps. A 429 raises `RateLimitError` with the code `rate_limited`, and the client retries it. The client does not retry a 5xx.
+- `token` is optional, the same as in the PHP and Ruby SDKs. A client with no token can call `forms.submit()`. Each other call raises `ValueError` before the send. A client with no token no longer raises in the constructor.
+- `WebhookVerificationError.reason` can be `"payload"`: the signature is valid, but the body is not a JSON object.
+- The webhook vectors have the expected `reason` of each invalid case and the `delivery_id` of each valid case.
+- The package is under the MIT License. `pyproject.toml` has `license = "MIT"`.
 
 ### Changed
+
+- Breaking: `client.whoami()` is now `client.account()`, the same name as in the other SDKs. The async client also has `account()`.
+- Breaking: the default timeout is 60 seconds. It was 30 seconds. A synchronous render can take that long, and the other SDKs use 60 seconds.
+- Breaking: a webhook with no `X-Snapsbrew-Delivery` header passes the verification. `WebhookEvent.delivery_id` is then `None`. The reason `"delivery"` is removed. Older instances do not send the header.
+- Breaking: `Snap.media_url` is the value that the instance sends. A failed snap has an empty string. It was `None`.
+- `verify_webhook()` raises the reason `"payload"` for a body that is not a JSON object. It was `json.JSONDecodeError` for invalid JSON, and the reason `"signature"` for a JSON value that is not an object.
+- `verify_webhook()` takes the first value of a header list, and treats an empty header as a missing header.
 
 - `Snap.media_url` is `None` when the instance sends an empty string. The webhook of a failed snap sends an empty string.
 - `ValidationError` documents a 422 with a `code` and no field errors. `documents.apply()` sends it when the document refuses an operation.

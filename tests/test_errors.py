@@ -67,7 +67,7 @@ def test_status_maps_to_error_class(
         Snapsbrew(base_url="https://snapsbrew.test", token="t", max_retries=0) as client,
         pytest.raises(error_class) as caught,
     ):
-        client.whoami()
+        client.account()
     error = caught.value
     assert type(error) is error_class
     assert isinstance(error, SnapsbrewError)
@@ -121,7 +121,7 @@ def test_rate_limit_error_has_retry_after_and_the_limit(api: respx.MockRouter) -
 def test_rate_limit_error_without_limit_headers(client: Snapsbrew, api: respx.MockRouter) -> None:
     api.get("/v1/auth").respond(429, headers={"Retry-After": "3600", "X-RateLimit-Limit": "x"})
     with pytest.raises(RateLimitError) as caught:
-        client.whoami()
+        client.account()
     assert caught.value.limit is None
     assert caught.value.remaining is None
 
@@ -221,7 +221,7 @@ def test_a_500_on_batch_create_is_a_server_error_with_the_generic_code(
 def test_editor_style_code_is_kept(client: Snapsbrew, api: respx.MockRouter) -> None:
     api.get("/v1/auth").respond(409, json={"code": "legacy_edit_rejected_for_v2"})
     with pytest.raises(ConflictError) as caught:
-        client.whoami()
+        client.account()
     assert caught.value.code == "legacy_edit_rejected_for_v2"
     assert caught.value.message == "legacy_edit_rejected_for_v2"
 
@@ -232,7 +232,7 @@ def test_a_non_json_error_body_uses_the_reason_phrase(api: respx.MockRouter) -> 
         Snapsbrew(base_url="https://snapsbrew.test", token="t", max_retries=0) as client,
         pytest.raises(ServerError) as caught,
     ):
-        client.whoami()
+        client.account()
     assert caught.value.message == "Bad Gateway"
     assert caught.value.body == "<html>Bad gateway</html>"
 
@@ -243,7 +243,7 @@ def test_connection_error(api: respx.MockRouter) -> None:
         Snapsbrew(base_url="https://snapsbrew.test", token="t", max_retries=0) as client,
         pytest.raises(APIConnectionError) as caught,
     ):
-        client.whoami()
+        client.account()
     assert not isinstance(caught.value, APITimeoutError)
     assert isinstance(caught.value.__cause__, httpx.ConnectError)
 
@@ -254,7 +254,7 @@ def test_timeout_error(api: respx.MockRouter) -> None:
         Snapsbrew(base_url="https://snapsbrew.test", token="t", max_retries=0) as client,
         pytest.raises(APITimeoutError),
     ):
-        client.whoami()
+        client.account()
 
 
 def test_a_success_body_that_is_not_json_is_an_error(
@@ -262,7 +262,7 @@ def test_a_success_body_that_is_not_json_is_an_error(
 ) -> None:
     api.get("/v1/auth").respond(200, text="<html>login</html>")
     with pytest.raises(SnapsbrewError, match="base_url"):
-        client.whoami()
+        client.account()
 
 
 # The body of a 403 for a token without the `api_requests` ability.
@@ -272,7 +272,7 @@ DOCUMENT = {"version": 2, "layers": [], "groups": []}
 
 # Each bearer operation of the sync client, as (method, path, call).
 BEARER_OPERATIONS: list[tuple[str, str, Callable[[Snapsbrew], object]]] = [
-    ("GET", "/v1/auth", lambda c: c.whoami()),
+    ("GET", "/v1/auth", lambda c: c.account()),
     ("GET", "/v1/templates", lambda c: c.templates.list()),
     ("GET", "/v1/templates/sizes", lambda c: c.templates.sizes()),
     ("GET", f"/v1/templates/{TEMPLATE_ID}", lambda c: c.templates.get(TEMPLATE_ID)),

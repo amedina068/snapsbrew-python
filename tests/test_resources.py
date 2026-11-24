@@ -60,18 +60,18 @@ def test_every_request_sends_the_token_and_accepts_json(
     client: Snapsbrew, api: respx.MockRouter
 ) -> None:
     route = api.get("/v1/auth").respond(json={"data": {"email": "a@b.c", "name": "Ada"}})
-    client.whoami()
+    client.account()
     request = route.calls.last.request
     assert request.headers["authorization"] == f"Bearer {TOKEN}"
     assert request.headers["accept"] == "application/json"
     assert request.headers["user-agent"].startswith("snapsbrew-python/")
 
 
-def test_whoami(client: Snapsbrew, api: respx.MockRouter) -> None:
+def test_account(client: Snapsbrew, api: respx.MockRouter) -> None:
     api.get("/v1/auth").respond(
         json={"data": {"email": "dev@example.com", "name": "Ada", "company": "Engines"}}
     )
-    account = client.whoami()
+    account = client.account()
     assert account.email == "dev@example.com"
     assert account.name == "Ada"
     assert account.company == "Engines"

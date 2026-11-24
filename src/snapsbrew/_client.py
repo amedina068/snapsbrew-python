@@ -24,6 +24,7 @@ from snapsbrew._base import (
     DEFAULT_MAX_RETRIES,
     NOT_GIVEN,
     BaseClient,
+    FilePart,
     NotGiven,
     RequestSpec,
     TimeoutTypes,
@@ -288,7 +289,7 @@ def _screenshot_body(url: str, width: int | None, height: int | None) -> dict[st
     return body
 
 
-def _upload_files(file: FileInput, filename: str | None) -> dict[str, tuple[str, bytes, str]]:
+def _upload_files(file: FileInput, filename: str | None) -> dict[str, FilePart]:
     # The client reads the whole file before the first attempt, so that a retry
     # sends the same bytes.
     if isinstance(file, (str, os.PathLike)):
@@ -303,6 +304,35 @@ def _upload_files(file: FileInput, filename: str | None) -> dict[str, tuple[str,
         name = filename or Path(str(getattr(file, "name", "upload"))).name
     mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
     return {"file": (name, content, mime)}
+
+
+FormValue = str | os.PathLike[str] | bytes | IO[bytes]
+"""A form layer value. A ``str`` is text. A path, bytes or a binary file object is an image."""
+
+
+def _form_spec(url: str, layers: Mapping[str, FormValue]) -> RequestSpec:
+    if not url.startswith(("https://", "http://")):
+        raise ValueError(
+            "Give the signed submit URL of the form, for example "
+            "https://snapsbrew.example.com/api/v1/embedded-forms/...?signature=..."
+        )
+    # Each part goes in ``files``, so that the body is multipart also when all
+    # the layers are text. A text part has no filename.
+    files: dict[str, FilePart] = {}
+    for key, value in layers.items():
+        field = f"layers[{key}]"
+        if isinstance(value, str):
+            files[field] = (None, value.encode("utf-8"))
+        else:
+            files[field] = _upload_files(value, None)["file"]
+    return RequestSpec("POST", url, files=files, signed=True)
+
+
+def _form_result(response: httpx.Response) -> Snap | list[Snap]:
+    body = decode_body(response)
+    if isinstance(body, list):
+        return _snaps_from_response(response)
+    return _snap_from_response(response)
 
 
 # --- The sync client ---------------------------------------------------------
@@ -320,8 +350,9 @@ class Snapsbrew(BaseClient):
     Args:
         base_url: The URL of your instance. The default is ``$SNAPSBREW_URL``.
         token: An API token with the ``api_requests`` ability. The default is
-            ``$SNAPSBREW_TOKEN``.
-        timeout: Seconds, or an ``httpx.Timeout``. The default is 30 seconds.
+            ``$SNAPSBREW_TOKEN``. Only ``forms.submit()`` works without a token.
+        timeout: Seconds, or an ``httpx.Timeout``. The default is 60 seconds,
+            because a synchronous render can take that long.
             ``None`` means no timeout.
         max_retries: The number of retries after a 429, a 5xx or a connection
             error. The default is 2. Use 0 to stop all retries.
@@ -349,8 +380,9 @@ class Snapsbrew(BaseClient):
         self.screenshots = Screenshots(self)
         self.media = MediaLibrary(self)
         self.guides = Guides(self)
+        self.forms = Forms(self)
 
-    def whoami(self) -> Account:
+    def account(self) -> Account:
         """Return the account of the token (``GET /v1/auth``)."""
         body = self._json(RequestSpec("GET", "/v1/auth", idempotent=True))
         return Account.from_dict(_object(unwrap_data(body)))
@@ -857,6 +889,32 @@ class Guides:
         return self._get(f"/v1/guides/purposes/{_segment(key, 'key')}")
 
 
+class Forms:
+    """Submit an embedded form.
+
+    A form renders on the account of its owner, so the client sends no token
+    to the submit URL. Copy the submit URL of the form from your instance. The
+    URL carries its own signature.
+    """
+
+    def __init__(self, client: Snapsbrew) -> None:
+        self._client = client
+
+    def submit(self, url: str, layers: Mapping[str, FormValue]) -> Snap | builtins.list[Snap]:
+        """Send the layers of a form and return the snap.
+
+        A template form returns one snap. A collection form returns a list of
+        snaps, and its layer keys are ``"{template uuid}__{layer key}"``. A
+        ``str`` value is text. A path, bytes or a binary file object is an image.
+
+        Raises:
+            NotFoundError: The signature is not valid, or the form does not exist.
+            RateLimitError: Too many submissions. ``code`` is ``"rate_limited"``.
+            ValueError: ``url`` is not an absolute URL.
+        """
+        return _form_result(self._client._send(_form_spec(url, layers)))
+
+
 # --- The async client --------------------------------------------------------
 
 
@@ -889,8 +947,9 @@ class AsyncSnapsbrew(BaseClient):
         self.screenshots = AsyncScreenshots(self)
         self.media = AsyncMediaLibrary(self)
         self.guides = AsyncGuides(self)
+        self.forms = AsyncForms(self)
 
-    async def whoami(self) -> Account:
+    async def account(self) -> Account:
         """Return the account of the token (``GET /v1/auth``)."""
         body = await self._json(RequestSpec("GET", "/v1/auth", idempotent=True))
         return Account.from_dict(_object(unwrap_data(body)))
@@ -1329,3 +1388,29 @@ class AsyncGuides:
     async def purpose(self, key: str) -> Any:
         """Return the full guide of one image purpose."""
         return await self._get(f"/v1/guides/purposes/{_segment(key, 'key')}")
+
+
+class AsyncForms:
+    """Submit an embedded form.
+
+    A form renders on the account of its owner, so the client sends no token
+    to the submit URL. Copy the submit URL of the form from your instance. The
+    URL carries its own signature.
+    """
+
+    def __init__(self, client: AsyncSnapsbrew) -> None:
+        self._client = client
+
+    async def submit(self, url: str, layers: Mapping[str, FormValue]) -> Snap | builtins.list[Snap]:
+        """Send the layers of a form and return the snap.
+
+        A template form returns one snap. A collection form returns a list of
+        snaps, and its layer keys are ``"{template uuid}__{layer key}"``. A
+        ``str`` value is text. A path, bytes or a binary file object is an image.
+
+        Raises:
+            NotFoundError: The signature is not valid, or the form does not exist.
+            RateLimitError: Too many submissions. ``code`` is ``"rate_limited"``.
+            ValueError: ``url`` is not an absolute URL.
+        """
+        return _form_result(await self._client._send(_form_spec(url, layers)))

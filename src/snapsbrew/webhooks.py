@@ -77,13 +77,14 @@ class WebhookEvent:
         type: The ``event`` field of the body, for example :data:`SNAP_COMPLETED`.
             A new instance version can send a type that this package does not know.
         delivery_id: The ``X-Snapsbrew-Delivery`` header. All attempts of one
-            delivery have the same value. Keep it to ignore a duplicate.
+            delivery have the same value. Keep it to ignore a duplicate. It is
+            ``None`` when an older instance sends no delivery header.
         timestamp: The ``X-Snapsbrew-Timestamp`` header, in Unix seconds.
         data: The decoded body.
     """
 
     type: str
-    delivery_id: str
+    delivery_id: str | None
     timestamp: int
     data: Mapping[str, Any] = field(repr=False)
 
@@ -133,7 +134,7 @@ def verify_webhook(
 
     Raises:
         WebhookVerificationError: Read ``reason``: ``"signature"``,
-            ``"timestamp"`` or ``"delivery"``.
+            ``"timestamp"`` or ``"payload"``.
         ValueError: ``secret`` is empty, or ``tolerance`` is less than 0.
     """
     if not secret:
@@ -144,21 +145,18 @@ def verify_webhook(
     body = payload.encode("utf-8") if isinstance(payload, str) else payload
     signature = _header(headers, SIGNATURE_HEADER)
     timestamp = _header(headers, TIMESTAMP_HEADER)
-    delivery_id = _header(headers, DELIVERY_HEADER)
 
     if signature is None:
         raise WebhookVerificationError(
             f"The {SIGNATURE_HEADER} header is missing.", reason="signature"
         )
-    if timestamp is None or not _UNIX_SECONDS.fullmatch(timestamp.strip()):
+    if timestamp is None or not _UNIX_SECONDS.fullmatch(timestamp):
         raise WebhookVerificationError(
             f"The {TIMESTAMP_HEADER} header is missing or is not Unix seconds.",
             reason="timestamp",
         )
-    timestamp = timestamp.strip()
-
     # Check the format first, so that compare_digest gets two ASCII strings.
-    received = signature.strip().lower()
+    received = signature.lower()
     if not _HEX_DIGEST.fullmatch(received) or not hmac.compare_digest(
         sign(timestamp, body, secret), received
     ):
@@ -166,25 +164,21 @@ def verify_webhook(
             "The signature does not match. Use the raw body and the secret of your company.",
             reason="signature",
         )
-
     current = time.time() if now is None else now
     if abs(current - int(timestamp)) > tolerance:
         raise WebhookVerificationError(
             f"The timestamp is more than {tolerance} seconds from the current time.",
             reason="timestamp",
         )
-
-    if not delivery_id:
-        raise WebhookVerificationError(
-            f"The {DELIVERY_HEADER} header is missing.", reason="delivery"
-        )
-
-    data = json.loads(body)
+    try:
+        data = json.loads(body)
+    except ValueError:
+        data = None
     if not isinstance(data, dict):
-        raise WebhookVerificationError("The body is not a JSON object.", reason="signature")
+        raise WebhookVerificationError("The body is not a JSON object.", reason="payload")
     return WebhookEvent(
         type=str(data.get("event", "")),
-        delivery_id=delivery_id,
+        delivery_id=_header(headers, DELIVERY_HEADER),
         timestamp=int(timestamp),
         data=data,
     )
@@ -201,12 +195,13 @@ def sign(timestamp: str, payload: bytes | str, secret: str) -> str:
 
 
 def _header(headers: Mapping[str, str] | Headers, name: str) -> str | None:
-    value = headers.get(name)
-    if value is not None:
-        return value
-    if isinstance(headers, Mapping):
+    """Return the trimmed header value, or ``None`` when it is missing or empty."""
+    value: Any = headers.get(name)
+    if value is None and isinstance(headers, Mapping):
         wanted = name.lower()
-        for key, item in headers.items():
-            if key.lower() == wanted:
-                return item
-    return None
+        value = next((item for key, item in headers.items() if key.lower() == wanted), None)
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else None
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return value.strip()

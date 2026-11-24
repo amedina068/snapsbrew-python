@@ -32,7 +32,8 @@ from snapsbrew.errors import (
     ValidationError,
 )
 
-DEFAULT_TIMEOUT: Final = 30.0
+# A synchronous render can take this long. The other SDKs use the same value.
+DEFAULT_TIMEOUT: Final = 60.0
 DEFAULT_MAX_RETRIES: Final = 2
 
 # The client does not wait longer than this for one Retry-After value. If the
@@ -59,6 +60,10 @@ NOT_GIVEN: Final = NotGiven()
 
 TimeoutTypes = float | httpx.Timeout | None
 
+# A multipart part: (filename, content) or (filename, content, content type).
+# A text field has no filename.
+FilePart = tuple[str | None, bytes] | tuple[str | None, bytes, str]
+
 
 @dataclass(frozen=True)
 class RequestSpec:
@@ -69,15 +74,20 @@ class RequestSpec:
 
     ``idempotency_key`` is the key in the body, if the request has one. Only a
     request with a key can wait for another request that holds the same key.
+
+    ``signed`` means that ``path`` is a full signed URL, for example the submit
+    URL of an embedded form. The URL carries its own authorization, so the
+    client does not send the token to it.
     """
 
     method: str
     path: str
     params: Sequence[tuple[str, str]] | None = None
     json: Any = None
-    files: Mapping[str, tuple[str, bytes, str]] | None = None
+    files: Mapping[str, FilePart] | None = None
     idempotent: bool = False
     idempotency_key: str | None = None
+    signed: bool = False
 
 
 def normalize_base_url(base_url: str) -> str:
@@ -108,15 +118,13 @@ class BaseClient:
                 "Give the URL of your Snapsbrew instance as base_url, "
                 "or set the SNAPSBREW_URL environment variable."
             )
-        if not token:
-            raise ValueError(
-                "Give an API token as token, or set the SNAPSBREW_TOKEN environment variable."
-            )
         if max_retries < 0:
             raise ValueError("max_retries must be 0 or more")
         self.base_url = normalize_base_url(base_url)
         self.max_retries = max_retries
-        self._token = token
+        # Only the form submit works without a token. Each other call checks
+        # the token in _build_request(), before the send.
+        self._token = (token or "").strip() or None
         self._timeout = timeout
 
     def __repr__(self) -> str:
@@ -133,18 +141,25 @@ class BaseClient:
         extra: dict[str, Any] = {}
         if not isinstance(self._timeout, NotGiven):
             extra["timeout"] = self._timeout
+        headers = {
+            # Laravel sends JSON errors only when the request accepts JSON.
+            "Accept": "application/json",
+            "User-Agent": USER_AGENT,
+        }
+        if not spec.signed:
+            if self._token is None:
+                raise ValueError(
+                    "The client has no API token. Give token, or set the SNAPSBREW_TOKEN "
+                    "environment variable. Only forms.submit() works without a token."
+                )
+            headers["Authorization"] = f"Bearer {self._token}"
         return http.build_request(
             spec.method,
-            f"{self.base_url}/api{spec.path}",
+            spec.path if spec.signed else f"{self.base_url}/api{spec.path}",
             params=list(spec.params) if spec.params else None,
             json=spec.json,
             files=dict(spec.files) if spec.files else None,
-            headers={
-                "Authorization": f"Bearer {self._token}",
-                # Laravel sends JSON errors only when the request accepts JSON.
-                "Accept": "application/json",
-                "User-Agent": USER_AGENT,
-            },
+            headers=headers,
             **extra,
         )
 

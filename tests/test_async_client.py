@@ -30,9 +30,9 @@ TEMPLATE_BODY = {
 }
 
 
-async def test_whoami(aclient: AsyncSnapsbrew, api: respx.MockRouter) -> None:
+async def test_account(aclient: AsyncSnapsbrew, api: respx.MockRouter) -> None:
     api.get("/v1/auth").respond(json={"data": {"email": "a@b.c", "name": "Ada", "company": None}})
-    account = await aclient.whoami()
+    account = await aclient.account()
     assert account.email == "a@b.c"
     assert account.company is None
 

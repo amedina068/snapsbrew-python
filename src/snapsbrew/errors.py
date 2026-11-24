@@ -259,7 +259,7 @@ class ServerError(APIError):
     """
 
 
-WebhookFailure = Literal["signature", "timestamp", "delivery"]
+WebhookFailure = Literal["signature", "timestamp", "payload"]
 
 
 class WebhookVerificationError(SnapsbrewError):
@@ -268,8 +268,9 @@ class WebhookVerificationError(SnapsbrewError):
     Attributes:
         reason: ``"signature"`` when the signature is missing or does not match.
             ``"timestamp"`` when the timestamp is missing, is not Unix seconds,
-            or is outside the tolerance. ``"delivery"`` when the delivery ID
-            is missing.
+            or is outside the tolerance. ``"payload"`` when the signature is
+            valid, but the body is not a JSON object. The JS, PHP and Ruby SDKs
+            use the same three reasons.
     """
 
     def __init__(self, message: str, *, reason: WebhookFailure) -> None:

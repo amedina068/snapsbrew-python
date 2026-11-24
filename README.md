@@ -32,6 +32,7 @@ print(snap.media_url)
 - [Retries](#retries)
 - [Django and FastAPI](#django-and-fastapi)
 - [Supported Python versions](#supported-python-versions)
+- [License](#license)
 
 ## Install
 
@@ -86,7 +87,7 @@ from snapsbrew import Snapsbrew
 client = Snapsbrew(
     base_url="https://snapsbrew.example.com",  # default: $SNAPSBREW_URL
     token="...",  # default: $SNAPSBREW_TOKEN
-    timeout=30.0,  # seconds, or an httpx.Timeout. None: no timeout
+    timeout=60.0,  # seconds, or an httpx.Timeout. None: no timeout
     max_retries=2,  # 0 stops all retries
 )
 ```
@@ -94,8 +95,8 @@ client = Snapsbrew(
 | Setting | Default | Description |
 |---|---|---|
 | `base_url` | `$SNAPSBREW_URL` | The URL of your instance. The client removes a trailing `/` and a trailing `/api`. |
-| `token` | `$SNAPSBREW_TOKEN` | An API token. The client sends it as `Authorization: Bearer <token>`. |
-| `timeout` | 30 seconds | The timeout of each request. |
+| `token` | `$SNAPSBREW_TOKEN` | An API token. The client sends it as `Authorization: Bearer <token>`. Each API call needs it. Only `forms.submit()` works without a token. If the client has no token, each other call raises `ValueError` before it sends the request. |
+| `timeout` | 60 seconds | The timeout of each request. A synchronous render can take that long. The other SDKs use the same value. |
 | `max_retries` | 2 | The number of retries. Read [Retries](#retries). |
 | `http_client` | a new `httpx.Client` | Your own `httpx.Client`. |
 
@@ -134,7 +135,7 @@ An image URL must be public. The instance refuses a private, loopback or link-lo
 ### Account
 
 ```python
-account = client.whoami()  # GET /v1/auth
+account = client.account()  # GET /v1/auth
 print(account.email, account.company)
 ```
 
@@ -309,6 +310,21 @@ A `Media` has `id`, `uuid`, `name`, `file_name`, `mime_type`, `size`, `original_
 
 The instance accepts JPG, JPEG, PNG, GIF, WebP and BMP files of 10 MB maximum. It refuses SVG. The client does not check the file. The instance sends `ValidationError` for a file that breaks a rule.
 
+### Embedded forms
+
+An embedded form renders a snap from the values that a visitor sends. The form renders on the account of its owner, so the client sends no token to the submit URL. A client with no token can submit a form. Copy the submit URL of the form from your instance. The URL carries its own signature.
+
+```python
+snap = client.forms.submit(submit_url, {"headline": "Hello", "photo": Path("photo.png")})
+snaps = client.forms.submit(collection_submit_url, {"141e8454-...__headline": "Hello"})  # A list
+```
+
+- A `str` value is text. A path, bytes or a binary file object is an image.
+- A template form uses the layer key, for example `headline`. A collection form uses `{template uuid}__{layer key}` and returns a list of snaps.
+- If the signature is not valid, or the form does not exist, `submit()` raises `NotFoundError`.
+- If one IP address or one form sends too many submissions in one minute, `submit()` raises `RateLimitError` with the code `rate_limited`. The client retries it.
+- The client does not retry a submit after a 5xx, because each submit renders a snap.
+
 ### Guides
 
 The guides are static catalogs. You can keep a response in a cache.
@@ -410,7 +426,7 @@ from snapsbrew import SNAP_COMPLETED, SNAP_FAILED, WebhookVerificationError, ver
 try:
     event = verify_webhook(raw_body, headers, secret)
 except WebhookVerificationError as error:
-    print(error.reason)  # "signature", "timestamp" or "delivery"
+    print(error.reason)  # "signature", "timestamp" or "payload"
     raise
 
 if event.type == SNAP_COMPLETED:
@@ -422,6 +438,16 @@ elif event.type == SNAP_FAILED:
 1. Give the raw request body, byte for byte. Do not parse the JSON and encode it again. The instance escapes `/` and non-ASCII characters, so a new encoding gives other bytes.
 2. Give the request headers. The header names are not case-sensitive.
 3. Give the full secret, with its `whsec_` prefix.
+
+`error.reason` tells why the verification failed. The JS, PHP and Ruby SDKs use the same three reasons:
+
+| `reason` | Cause |
+|---|---|
+| `"signature"` | The signature header is missing, or the signature does not match the body. |
+| `"timestamp"` | The timestamp header is missing, is not Unix seconds, or is outside the tolerance. |
+| `"payload"` | The signature is valid, but the body is not a JSON object. |
+
+The signature can be lowercase or uppercase hex.
 
 `verify_webhook()` compares the signature in constant time. It refuses a timestamp that is more than 300 seconds from the current time. To change this limit, give `tolerance` in seconds. In a test, give `now` as the current Unix time:
 
@@ -435,7 +461,7 @@ event = verify_webhook(raw_body, headers, secret, now=1767225600)
 | Field | Value |
 |---|---|
 | `type` | The `event` field of the body. |
-| `delivery_id` | The `X-Snapsbrew-Delivery` header. All attempts of one delivery have the same value. |
+| `delivery_id` | The `X-Snapsbrew-Delivery` header. All attempts of one delivery have the same value. `None` when an older instance sends no delivery header. |
 | `timestamp` | The `X-Snapsbrew-Timestamp` header, in Unix seconds. |
 | `data` | The decoded body. |
 | `snap` | A `Snap`, for a `snap.*` event. Else `None`. |
@@ -451,7 +477,7 @@ The instance can send one delivery more than one time. Keep each `delivery_id` a
 | `snap-import.failed` | `SNAP_IMPORT_FAILED` | `import` and `template` |
 | `snap-import.canceled` | `SNAP_IMPORT_CANCELED` | `import` and `template` |
 
-For a failed snap, `event.snap.media_url` is `None`. A new instance version can send a new event. Make your code accept an event type that it does not know.
+For a failed snap, `event.snap.media_url` is an empty string, the value that the instance sends. A new instance version can send a new event. Make your code accept an event type that it does not know.
 
 To make a signed webhook in your own tests, use `sign()`:
 
@@ -525,24 +551,30 @@ An argument that breaks a rule of the API before the request, for example an emp
 
 ## Retries
 
-The client retries a failed request two times by default. The wait before each retry grows exponentially (0.5, 1, 2 ... seconds, 8 seconds maximum) and has random jitter.
+The client retries a failed request two times by default. The wait before retry 1, 2, 3 and more is 0.5, 1, 2 ... seconds, to a maximum of 8 seconds. Half of each wait is random. The JS, PHP and Ruby SDKs use the same rules.
 
-| Failure | GET, and POST with `idempotency_key` | Other POST, PUT and PATCH |
+| Failure | Idempotent request | Other request |
 |---|---|---|
 | 429 | Retry | Retry |
-| 409 `idempotency_key_in_progress` | Retry (POST with a key only) | No retry |
+| 409 `idempotency_key_in_progress` | Retry (a request with a key only) | No retry |
 | Other 409 | No retry | No retry |
 | 5xx | Retry | No retry |
-| Connection not made (DNS, refused, pool timeout) | Retry | Retry |
+| Connection not made (DNS, refused, connect timeout, pool timeout) | Retry | Retry |
 | Read timeout or dropped connection | Retry | No retry |
 | Other 4xx | No retry | No retry |
 
+These requests are idempotent:
+
+- Each `GET` and each `DELETE`, for example `templates.delete()`. After a lost response, a retried `templates.delete()` raises `NotFoundError`, because the first request removed the template.
+- `templates.publish()`, `templates.set_tags()` and `batches.cancel()`.
+- `snaps.create()` and `batches.create()` with an `idempotency_key`.
+
+The other requests are not idempotent: `templates.create()`, `templates.update()`, `snaps.create()` and `batches.create()` with no key, `screenshots.create()`, `media.upload()`, `tags.create()` and `forms.submit()`. An editor document write (`documents.replace()` and `documents.apply()`) is never retried after a 5xx or a timeout, because a repeat gets a 409.
+
 - If a response has a `Retry-After` header, the client waits for that time.
-- If `Retry-After` is more than 60 seconds, the client does not wait. It raises `RateLimitError` at once.
+- If `Retry-After` is more than 60 seconds, the client does not wait. It raises the error at once.
 - The API allows 60 requests per minute for one user. A preview also has a limit of 10 per minute. Each response has the headers `X-RateLimit-Limit` and `X-RateLimit-Remaining`.
 - If another request holds the same idempotency key, the client waits with the normal backoff and sends the request again. If the other request does not finish before the last retry, the client raises `ConflictError`.
-- `batches.cancel()`, `templates.publish()`, `templates.set_tags()` and `templates.delete()` are idempotent, so the client retries them like a GET.
-- The client does not retry `templates.create()`, `templates.update()`, `tags.create()` or an editor document write after a 5xx or a read timeout.
 - Set `max_retries=0` to stop all retries.
 
 ## Django and FastAPI
@@ -606,6 +638,7 @@ def snapsbrew_webhook(request: HttpRequest) -> HttpResponse:
     except WebhookVerificationError:
         return HttpResponseBadRequest()
 
+    # delivery_id is None when an older instance sends no delivery header.
     if event.type == SNAP_COMPLETED and not already_seen(event.delivery_id):
         save_image(event.snap.id, event.snap.media_url)
     return HttpResponse(status=204)
@@ -670,6 +703,7 @@ async def snapsbrew_webhook(request: Request) -> Response:
     except WebhookVerificationError as error:
         raise HTTPException(status_code=400, detail=error.reason) from error
 
+    # delivery_id is None when an older instance sends no delivery header.
     if event.type == SNAP_COMPLETED and not already_seen(event.delivery_id):
         save_image(event.snap.id, event.snap.media_url)
     return Response(status_code=204)
@@ -684,3 +718,7 @@ The package has full type hints and a `py.typed` file. `mypy --strict` passes on
 ## Development
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## License
+
+The package is available under the [MIT License](LICENSE).

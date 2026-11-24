@@ -33,8 +33,8 @@ def live(monkeypatch: pytest.MonkeyPatch) -> Iterator[Snapsbrew]:
         yield client
 
 
-def test_whoami(live: Snapsbrew) -> None:
-    account = live.whoami()
+def test_account(live: Snapsbrew) -> None:
+    account = live.account()
     assert account.email
 
 
