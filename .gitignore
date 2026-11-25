@@ -24,3 +24,7 @@ htmlcov/
 .idea/
 .vscode/
 .DS_Store
+
+# Internal notes of the maintainer
+BRIEF.md
+REPORT-*.md

@@ -1,5 +1,8 @@
 # snapsbrew
 
+[![CI](https://github.com/amedina068/snapsbrew-python/actions/workflows/ci.yml/badge.svg)](https://github.com/amedina068/snapsbrew-python/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 The Python client for Snapsbrew. Snapsbrew renders images ("snaps") from templates.
 
 Snapsbrew is self-hosted. Each client connects to one Snapsbrew instance, so the URL of your instance is a required setting.
@@ -32,6 +35,8 @@ print(snap.media_url)
 - [Retries](#retries)
 - [Django and FastAPI](#django-and-fastapi)
 - [Supported Python versions](#supported-python-versions)
+- [Related projects](#related-projects)
+- [Community](#community)
 - [License](#license)
 
 ## Install
@@ -44,7 +49,7 @@ pip install "git+https://github.com/amedina068/snapsbrew-python.git"
 uv add "git+https://github.com/amedina068/snapsbrew-python.git"
 ```
 
-The repository is private. Git must have access to it, for example with an SSH key or with `gh auth setup-git`. To install a fixed commit, add `@<commit>` to the URL.
+To install a fixed commit, add `@<commit>` to the URL.
 
 The package has one dependency: [httpx](https://www.python-httpx.org/).
 
@@ -715,10 +720,22 @@ The package supports Python 3.10, 3.11, 3.12, 3.13 and 3.14. CI runs the tests, 
 
 The package has full type hints and a `py.typed` file. `mypy --strict` passes on the package.
 
-## Development
+## Related projects
 
-Read [CONTRIBUTING.md](CONTRIBUTING.md).
+- [Snapsbrew](https://github.com/amedina068/snapsbrew): the self-hosted app that this SDK calls. It uses the AGPL-3.0.
+- [Documentation](https://snapsbrew.com/docs): the guides for the app and the SDKs. The source is in [snapsbrew-docs](https://github.com/amedina068/snapsbrew-docs).
+- [SDK overview](https://snapsbrew.com/docs/sdks/overview): the install steps and the features of each SDK.
+- SDKs for other languages: [TypeScript](https://github.com/amedina068/snapsbrew-js), [PHP](https://github.com/amedina068/snapsbrew-php), [Ruby](https://github.com/amedina068/snapsbrew-ruby).
+
+## Community
+
+- [CONTRIBUTING.md](CONTRIBUTING.md): how to set up the code and open a pull request.
+- [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md): the rules for issues, pull requests, and reviews.
+- [SECURITY.md](SECURITY.md): how to report a security problem in private.
+- [CHANGELOG.md](CHANGELOG.md): the changes in each version.
+
+Report a problem with the SDK in the issues of this repository. Report a problem with the app in the [Snapsbrew issues](https://github.com/amedina068/snapsbrew/issues).
 
 ## License
 
-The package is available under the [MIT License](LICENSE).
+This SDK is available under the [MIT License](LICENSE). You can use it in closed source code. The Snapsbrew app uses the AGPL-3.0. That license does not cover this SDK.
