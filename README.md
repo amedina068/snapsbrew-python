@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/amedina068/snapsbrew-python/actions/workflows/ci.yml/badge.svg)](https://github.com/amedina068/snapsbrew-python/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/amedina068/snapsbrew-python/badge)](https://scorecard.dev/viewer/?uri=github.com/amedina068/snapsbrew-python)
 
 The Python client for Snapsbrew. Snapsbrew renders images ("snaps") from templates.
 
