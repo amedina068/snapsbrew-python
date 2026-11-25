@@ -4,7 +4,9 @@ All notable changes to this package are in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The package uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.2.0] - Unreleased
+## [Unreleased]
+
+## [0.2.0] - 2026-11-25
 
 This version adopts the OpenAPI spec of Snapsbrew PR #93 and the webhook signatures of Snapsbrew PR #95.
 
@@ -53,7 +55,9 @@ This version adopts the OpenAPI spec of Snapsbrew PR #93 and the webhook signatu
 
 - The text that says that a render costs a credit. The instance keeps a usage log with no balance.
 
-## [0.1.0] - Unreleased
+## [0.1.0] - Not published
+
+Version 0.1.0 was not published. Release 0.2.0 contains these changes.
 
 ### Added
 
