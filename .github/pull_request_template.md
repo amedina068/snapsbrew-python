@@ -13,3 +13,4 @@
 - [ ] The sync client and the async client have the same change.
 - [ ] I added a line to `CHANGELOG.md` under `Unreleased`.
 - [ ] The change has no token, key or other secret.
+- [ ] The PR title follows Conventional Commits (`feat:`, `fix:`, `docs:`, `chore:` and similar).

@@ -1,6 +1,6 @@
 name: Bug report
 description: Tell us about a problem in the Python client.
-labels: ["bug"]
+labels: ["bug", "needs-triage"]
 body:
   - type: markdown
     attributes:

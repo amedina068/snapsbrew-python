@@ -66,3 +66,17 @@ Write docs, comments, error messages and commit messages in Simple English (ASD-
 2. Make the change and run the checks.
 3. Add a line to `CHANGELOG.md` under `Unreleased`.
 4. Open a pull request. Fill in the template.
+
+## Pull request titles
+
+The title of a pull request must follow [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/). The `PR title` check of the CI fails if the title does not follow it. The titles of the merged pull requests become the lines of the release notes, so a clear title helps each user.
+
+Start the title with a type: `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`, `chore` or `revert`. A scope in parentheses is optional. Examples:
+
+- `feat: add a method to cancel a snap batch`
+- `fix(async): close the HTTP client on exit`
+- `docs: add a webhook example to the README`
+
+## Triage
+
+Each new issue gets the `needs-triage` label. The maintainer reads the issue and replaces `needs-triage` with a type label, for example `bug`, `enhancement`, `documentation` or `question`.
